@@ -10,4 +10,5 @@ if [[ "${1-}" == '--doctor' ]]; then
     shift
     exec "$PYTHON" -I "$ROOT/tools/cachyos.py" launch --doctor -- "$@"
 fi
+"$PYTHON" -I "$ROOT/roi_update.py" --launch
 exec "$PYTHON" -I "$ROOT/tools/cachyos.py" launch -- "$@"

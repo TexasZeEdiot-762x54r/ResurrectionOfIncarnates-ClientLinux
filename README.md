@@ -49,3 +49,13 @@ server operator. LAN never falls back to Steam or the shared Internet server.
 Lamina, Windows-Python account registration under Proton, media playback and a
 full post-battle receipt on this exact patch. Do not describe these as supported
 merely because setup or a Linux lobby test succeeds.
+
+## Client updates
+
+The launcher checks the signed development feed before play in public Internet mode.
+Accept the prompt to install or decline to play the current build. LAN and private
+VPN configurations make no public update request. To check manually run
+`python roi_update.py --check` (Linux: `python3`); use `--apply` to install.
+On Linux install OpenSSH client tools and zenity or kdialog for a desktop prompt.
+On Windows use the Windows OpenSSH Client optional feature. Updates do not
+download Steam's original game or change account credentials.
