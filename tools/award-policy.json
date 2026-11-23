@@ -556,5 +556,11 @@
       "chance_percent": 1
     }
   },
-  "notes": "Explicit owner-selected reconstructed cumulative XP tables are enabled: player cap 50 and character cap 30. Character levels 23-30 continue the last supported +200 segment. Level-up cube-or-LP bonus balance remains disabled. Grid reward levels use the owner-selected revival schedule in grid-reward-policy.json."
+  "notes": "Explicit owner-selected reconstructed cumulative XP tables are enabled: player cap 50 and character cap 30. Character levels 23-30 continue the last supported +200 segment. Level-up cube-or-LP bonus balance remains disabled. Grid reward levels use the owner-selected revival schedule in grid-reward-policy.json.",
+  "draw_rewards": {
+    "enabled": true,
+    "basis": "loss",
+    "provenance": "user_selected_revival",
+    "source": "Owner approved 2026-11-21: completed draws award loss-equivalent LP and player/character XP; Ranked points remain unchanged. No disconnected or incomplete match award selected."
+  }
 }

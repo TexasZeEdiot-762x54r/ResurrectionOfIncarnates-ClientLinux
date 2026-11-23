@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import platform
+import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -253,10 +255,12 @@ def stop_owned(children):
             child.wait(timeout=3)
 
 
-def launch(args):
+def _launch(args):
     supported_platform()
     os.environ['ROI_DEPLOYMENT_FILE'] = str(ROOT / 'deployment.local.json')
     verify_package()
+    from public_channel import configure
+    configure(ROOT)
     cfg = strict_json((HERE / 'config.json').read_text())
     if cfg.get('release_mode') == 'lan':
         raise ValueError('Steam-free LAN battle adapter has not passed review; no online fallback')
@@ -285,6 +289,7 @@ def launch(args):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise RuntimeError('This revival client is already starting or running')
+        ensure_reward_credential(HERE)
         call_tool(sys.executable, HERE / 'public_tunnel.py', '--check')
         with (logs / 'proton-preflight.log').open('w') as output:
             subprocess.run(command + ['--preflight'], env=env, cwd=Path(cfg['game']) / 'exe',
@@ -296,6 +301,8 @@ def launch(args):
         with (logs/'account-enroll.log').open('w') as output:
             subprocess.run(command+['--enroll'],env=env,cwd=Path(cfg['game'])/'exe',stdout=output,
                            stderr=subprocess.STDOUT,timeout=120,check=True)
+        import linux_launch_diagnostics
+        linux_launch_diagnostics.enrolled()
         from network_defaults import LOOPBACK
         for port in PORTS:
             with socket.socket() as probe:
@@ -342,6 +349,33 @@ def launch(args):
                 stream.close()
             for sig, handler in old_handlers.items():
                 signal.signal(sig, handler)
+
+
+def ensure_reward_credential(directory):
+    """Provision the installation-local capability shared with Windows Python."""
+    path = Path(directory) / 'lp-bridge-token.txt'
+    flags = getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | flags, 0o600)
+    except FileExistsError:
+        fd = os.open(path, os.O_RDONLY | flags)
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077 or info.st_nlink != 1 or info.st_size > 128):
+                raise ValueError('Local reward credential must be a private user-owned regular file')
+            if not re.fullmatch(rb'[0-9a-f]{64}', stream.read(129).strip()):
+                raise ValueError('Invalid local reward credential; restore or remove it before launch')
+        return
+    with os.fdopen(fd, 'w', encoding='ascii') as stream:
+        stream.write(secrets.token_hex(32))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def launch(args):
+    import linux_launch_diagnostics
+    return linux_launch_diagnostics.run(ROOT, lambda: _launch(args))
 
 
 def main():

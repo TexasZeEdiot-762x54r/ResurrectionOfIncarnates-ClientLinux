@@ -15,7 +15,7 @@ def validate(value, uid):
     if not isinstance(value, dict) or set(value) not in (legacy, legacy | streaks) or value['sv_uid'] != uid:
         raise ValueError('Invalid server rank identity')
     value = dict(sv_winStreakCount='0',sv_winStreakMax='0',**value) if set(value)==legacy else value
-    for name, minimum, maximum in (('sv_rankId',1,30), ('sv_rankPoint',0,2147483647), ('sv_revision',0,2**63-1),
+    for name, minimum, maximum in (('sv_rankId',1,35), ('sv_rankPoint',0,2147483647), ('sv_revision',0,2**63-1),
                                    ('sv_winStreakCount',0,2147483647), ('sv_winStreakMax',0,2147483647)):
         raw = value[name]
         if not isinstance(raw,str) or len(raw)>20 or not re.fullmatch(r'0|[1-9][0-9]*',raw) or not minimum<=int(raw)<=maximum:

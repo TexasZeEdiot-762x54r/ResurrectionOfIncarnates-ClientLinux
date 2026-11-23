@@ -15,10 +15,12 @@ def label(root=None):
         try: installed=read(root/'.roi-update/installed.json')
         except FileNotFoundError: installed=base['release']
         data=json.loads(base64.b64decode(installed['payload'],validate=True))
+        if base['stream'].startswith('stable/') and data['stream']=='dev/'+base['stream'].split('/')[1]:
+            data=json.loads(base64.b64decode(base['release']['payload'],validate=True))
         rev=data['revision']
         if (data['game']=='rise-of-incarnates/2.06' and data['format']==1
                 and data['stream']==base['stream'] and type(rev) is int and 1<=rev<=999999999):
-            return f'2.06 - R{rev}'
+            return f'2.06 - R{rev-3}P' if base['stream'].startswith('stable/') and rev>=4 else f'2.06 - R{rev}'
     except (OSError,KeyError,TypeError,ValueError,RecursionError):
         pass
     return None

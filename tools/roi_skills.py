@@ -25,17 +25,27 @@ def master(saved=None):
                  dict(sv_effectId='0', sv_minPercentage='0', sv_maxPercentage='0', sv_behavior='0')],
              'sv_cobeCount': '2', 'sv_skillcubePrice': '0',
              'sv_skillcubeStatus': '1', 'sv_skillcubeCategory': '0', 'sv_sort': '0'}]
-    if saved is not None and saved.get('diagnosticSkillCube') is not True:
-        rows = []
+    # The definition is game data, not ownership: it is served to every client, because battles run in
+    # lockstep and every machine applies every player's cubes. Without it, a machine whose own profile
+    # lacks diagnosticSkillCube gave another player's 20x cube no effect, computed different damage
+    # and the battle aborted (2026-11-15). Ownership stays gated in inventory().
     if saved and saved.get('originalSkillCubes') is True:
         import roi_skill_catalogue
         rows.extend(roi_skill_catalogue.master())
     return rows
 
 
+def definitions():
+    """Every cube definition (diagnostic cube and the released catalogue), independent of any profile.
+
+    Served as the game's skill-cube master data to every client, so lockstep battles apply every
+    player's cubes identically on every machine. Defining a cube does not grant it.
+    """
+    return master(dict(originalSkillCubes=True))
+
+
 def inventory(saved):
-    import release_policy
-    if not enabled(saved) or (saved.get('skillGridRuleset') and not release_policy.grid_allowed(saved)):
+    if not enabled(saved):
         return []
     import roi_cube_synthesis
     rows = [{'sv_skillcubeHoldId': str(HOLD_ID), 'sv_skillcubeId': str(CUBE_ID),
@@ -208,8 +218,7 @@ def _validate_grid(source, counts, original_mode, saved, expected):
 
 
 def grids(saved):
-    import release_policy
-    if not enabled(saved) or (saved.get('skillGridRuleset') and not release_policy.grid_allowed(saved)):
+    if not enabled(saved):
         return []
     value = deepcopy(saved.get('skillGrids', [empty_grid(progressive=progression(saved))]))
     # Migrate the first diagnostic schema only; original inventories are not involved.

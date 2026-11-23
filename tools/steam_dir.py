@@ -137,6 +137,20 @@ class SteamDirectory:
             return out
         return self._do(job, timeout=5) or []
 
+    def ranking_friends(self):
+        def job():
+            self.api.SteamFriends.restype = c_vp
+            friends = self.api.SteamFriends()
+            if not friends:
+                return set()
+            ids = set()
+            for i in range(max(0,_vcall(friends,3,c_int,(c_int,4)))):
+                sid = c_u64()
+                _vcall(friends,4,c_vp,(c_vp,ctypes.cast(ctypes.byref(sid),c_vp)),(c_int,i),(c_int,4))
+                ids.add(str(sid.value))
+            return ids
+        return self._do(job,timeout=5) or set()
+
     def friends_in_game(self):
         """{Steam id: in_a_lobby} for this player's Steam friends who are running Rise of Incarnates.
         ISteamFriends014: GetFriendCount(flags) slot 3, GetFriendByIndex slot 4 (CSteamID via hidden pointer),

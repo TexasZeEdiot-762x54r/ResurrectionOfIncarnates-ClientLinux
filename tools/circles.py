@@ -42,10 +42,9 @@ MEMBER_POSITION = '0'
 SUPPORTED = {'setupCircle', 'getCircleInfo', 'getCircleMemberList', 'findCircle',
              'getCircleName', 'leaveCircle', 'breakUpCircle', 'changeComment',
              'changeCircleIcon', 'changeEntryQualifications', 'changeCircleArea',
-             'incMaxNumOfMembers', 'incMaxNumOfSubLeaders'}
-UNSUPPORTED = {'joinCircle', 'replyToJoinCircle', 'inviteCircle', 'replyToInviteCircle',
-               'kickCircleMember',
-               'assignLeader', 'changeSubLeader'}
+             'incMaxNumOfMembers', 'incMaxNumOfSubLeaders', 'joinCircle', 'changeSubLeader', 'kickCircleMember'}
+UNSUPPORTED = {'replyToJoinCircle', 'inviteCircle', 'replyToInviteCircle',
+               'assignLeader'}
 
 
 def integer(value, low=0, high=2**31-1):
@@ -103,6 +102,8 @@ def database():
                    'uid TEXT PRIMARY KEY, circle_id INTEGER NOT NULL, name TEXT NOT NULL, '
                    'joined INTEGER NOT NULL, rank INTEGER NOT NULL)')
         db.execute('CREATE INDEX IF NOT EXISTS circle_member_parent ON circle_members(circle_id)')
+        db.execute('CREATE TABLE IF NOT EXISTS circle_subleaders ('
+                   'uid TEXT PRIMARY KEY, circle_id INTEGER NOT NULL)')
         for policy in CAPACITY_POLICIES.values():
             # Identifiers come only from the fixed policy table, never a request.
             db.execute('CREATE TABLE IF NOT EXISTS '+policy['table']+' ('
@@ -141,9 +142,11 @@ def snapshot(db, row):
                     sv_subLeaderCount='0', sv_subLeaderUids=[], sv_members=[], sv_invitings=[])
     members = db.execute('SELECT * FROM circle_members WHERE circle_id=? ORDER BY joined,uid',
                          (row['id'],)).fetchall()
+    deputies = {r[0] for r in db.execute('SELECT s.uid FROM circle_subleaders s JOIN circle_members m '
+                'ON m.uid=s.uid AND m.circle_id=s.circle_id WHERE s.circle_id=?', (row['id'],))}
     people = [dict(sv_uid=m['uid'], sv_onlineId=m['uid'], sv_userName=m['name'],
                    sv_rankId=str(m['rank']), sv_joinTime=str(m['joined']), sv_joinMethod='0',
-                   sv_loginTime='0', sv_position=LEADER_POSITION if m['uid'] == row['leader'] else MEMBER_POSITION)
+                   sv_loginTime='0', sv_position=LEADER_POSITION if m['uid'] == row['leader'] else '1' if m['uid'] in deputies else MEMBER_POSITION)
               for m in members]
     leader = next((m['name'] for m in members if m['uid'] == row['leader']), '')
     capacity = db.execute('SELECT maximum FROM circle_capacity WHERE circle_id=?', (row['id'],)).fetchone()
@@ -155,7 +158,7 @@ def snapshot(db, row):
                 sv_memberCount=str(len(people)), sv_status='1', sv_gamePoint='0',
                 sv_leaderUid=row['leader'], sv_leaderName=leader,
                 sv_subLeaderMax=str(subleaders[0] if subleaders else 0),
-                sv_subLeaderCount='0', sv_subLeaderUids=[], sv_members=people, sv_invitings=[])
+                sv_subLeaderCount=str(len(deputies)), sv_subLeaderUids=sorted(deputies,key=int), sv_members=people, sv_invitings=[])
 
 
 def expand_capacity(db, own, uid, data, kind):
@@ -220,6 +223,76 @@ def perform(uid, name, action, data):
         if action in ('incMaxNumOfMembers', 'incMaxNumOfSubLeaders'):
             kind = 'members' if action == 'incMaxNumOfMembers' else 'subleaders'
             result = expand_capacity(db, own, uid, data, kind)
+        elif action == 'kickCircleMember':
+            if own is None or own['leader'] != uid:
+                raise ValueError('Only the leader can dismiss Circle members')
+            targets=data.get('sv_uids')
+            if set(data)!={'sv_uids'} or not isinstance(targets,list) or not 1<=len(targets)<=MAX_MEMBERS:
+                raise ValueError('Invalid dismissal targets')
+            targets=[str(integer(value,1,2**64-1)) for value in targets]
+            if len(set(targets))!=len(targets) or uid in targets:
+                raise ValueError('Cannot dismiss the Circle leader or duplicate targets')
+            # Validate the complete batch before deleting anything. A target
+            # already absent is a harmless retry; another Circle is never touched.
+            for target in targets:
+                member=membership(db,target)
+                if member is not None and member['id']!=own['id']:
+                    raise ValueError('Dismissal target belongs to another Circle')
+            db.executemany('DELETE FROM circle_subleaders WHERE circle_id=? AND uid=?',
+                           [(own['id'],target) for target in targets])
+            db.executemany('DELETE FROM circle_members WHERE circle_id=? AND uid=?',
+                           [(own['id'],target) for target in targets])
+            # Native type67 has no payload parser; the UI reloads Circle info.
+            result={}
+        elif action == 'changeSubLeader':
+            if own is None or own['leader'] != uid:
+                raise ValueError('Only the leader can change subleaders')
+            if set(data)-{'sv_assignUids','sv_castDownUids'}:
+                raise ValueError('Invalid subleader fields')
+            batches=[]
+            for key in ('sv_assignUids','sv_castDownUids'):
+                values=data.get(key,[])
+                if not isinstance(values,list) or len(values)>MAX_MEMBERS:
+                    raise ValueError('Invalid subleader list')
+                values=[str(integer(v,1,2**64-1)) for v in values]
+                if len(set(values))!=len(values):raise ValueError('Duplicate subleader target')
+                batches.append(set(values))
+            promote,demote=batches
+            if not promote|demote or promote&demote or uid in promote|demote:
+                raise ValueError('Invalid subleader transition')
+            for target in promote|demote:
+                member=membership(db,target)
+                if member is None or member['id']!=own['id']:
+                    raise ValueError('Subleader target is not a Circle member')
+            current=snapshot(db,own)
+            roles=(set(current['sv_subLeaderUids'])-demote)|promote
+            if len(roles)>int(current['sv_subLeaderMax']):
+                raise ValueError('Purchase another subleader allowance first')
+            db.executemany('DELETE FROM circle_subleaders WHERE circle_id=? AND uid=?',[(own['id'],v) for v in demote])
+            db.executemany('INSERT OR IGNORE INTO circle_subleaders VALUES (?,?)',[(v,own['id']) for v in promote])
+            result = {'sv_subLeaderUids': sorted(roles, key=int)}
+        elif action == 'joinCircle':
+            cid = integer(data.get('sv_circleId'), 1, 2**63-1)
+            if integer(data.get('sv_cancel'), 0, 1) != 0:
+                raise ValueError('Circle application cancellation is not implemented')
+            if own:
+                if own['id'] != cid:
+                    raise ValueError('Already belongs to a Circle')
+            else:
+                row = db.execute('SELECT * FROM circles WHERE id=?', (cid,)).fetchone()
+                if row is None or row['invite_only']:
+                    raise ValueError('Circle is missing or requires an invitation')
+                # Qualified entry needs authoritative rank validation, not a caller-supplied rank.
+                if row['min_rank'] != 0:
+                    raise ValueError('Rank-qualified Circle membership is not implemented')
+                capacity = db.execute('SELECT maximum FROM circle_capacity WHERE circle_id=?', (cid,)).fetchone()
+                maximum = capacity[0] if capacity else MEMBER_LIMIT
+                count = db.execute('SELECT COUNT(*) FROM circle_members WHERE circle_id=?', (cid,)).fetchone()[0]
+                if count >= maximum:
+                    raise ValueError('Circle is full')
+                db.execute('INSERT INTO circle_members VALUES (?,?,?,?,?)',
+                           (uid, cid, name, int(time.time()), 1))
+                own = membership(db, uid)
         elif action == 'setupCircle':
             title = text(data.get('sv_name'), 64).strip()
             emblem = icon(data.get('sv_circleIcon', ''))
@@ -300,6 +373,7 @@ def perform(uid, name, action, data):
                     if own['leader'] != uid:
                         raise ValueError('Only the leader can disband')
                     db.execute('DELETE FROM circle_members WHERE circle_id=?', (own['id'],))
+                    db.execute('DELETE FROM circle_subleaders WHERE circle_id=?', (own['id'],))
                     db.execute('DELETE FROM circle_capacity WHERE circle_id=?', (own['id'],))
                     db.execute('DELETE FROM circle_subleader_capacity WHERE circle_id=?', (own['id'],))
                     db.execute('DELETE FROM circles WHERE id=?', (own['id'],))
@@ -307,6 +381,7 @@ def perform(uid, name, action, data):
                     if own['leader'] == uid:
                         raise ValueError('Leader must disband instead of leaving')
                     db.execute('DELETE FROM circle_members WHERE uid=?', (uid,))
+                    db.execute('DELETE FROM circle_subleaders WHERE uid=?', (uid,))
                 own = None
         else:
             if own is None or own['leader'] != uid:

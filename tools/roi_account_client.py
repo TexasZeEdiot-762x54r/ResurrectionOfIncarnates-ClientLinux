@@ -16,7 +16,10 @@ ISSUER = json.loads((HERE/'config.json').read_text('utf-8-sig'))['public_lobby_h
 
 
 class RegistrationError(ValueError):
-    pass
+    def __init__(self, message, *, stage=None, http_status=None):
+        super().__init__(message)
+        self.stage = stage
+        self.http_status = http_status
 
 
 def read_credential(path):
@@ -67,12 +70,12 @@ def private_create(path, value):
 async def exchange(options, method, path, token=None, body=None):
     from tls_transport import pinned_connection, close, CHANNELS
     if options[0] != ISSUER:
-        raise RegistrationError('Unexpected account server')
+        raise RegistrationError('Unexpected account server', stage='server-config')
     reader, writer = await pinned_connection(*options)
     try:
         raw = json.dumps(body, separators=(',', ':')).encode() if body is not None else b''
         if len(raw) > 16384:
-            raise RegistrationError('Registration request too large')
+            raise RegistrationError('Registration request too large', stage='request-size')
         headers = [method+' '+path+' HTTP/1.1', 'Host: '+ISSUER, 'Connection: close',
                    'Content-Type: application/json', 'Content-Length: '+str(len(raw))]
         if path == '/registration' or path.startswith('/registration/'):
@@ -88,7 +91,7 @@ async def exchange(options, method, path, token=None, body=None):
         await asyncio.wait_for(writer.drain(), 5)
         block = await asyncio.wait_for(reader.readuntil(b'\r\n\r\n'), 12)
         if len(block) > 8192:
-            raise RegistrationError('Invalid registration response')
+            raise RegistrationError('Invalid registration response', stage='response-headers')
         lines = block.decode('ascii').split('\r\n')
         code = int(lines[0].split()[1])
         values = {}
@@ -98,18 +101,21 @@ async def exchange(options, method, path, token=None, body=None):
             name, value = line.split(':', 1)
             name = name.lower()
             if name in values:
-                raise RegistrationError('Duplicate response header')
+                raise RegistrationError('Duplicate response header', stage='response-headers')
             values[name] = value.strip()
         size = int(values.get('content-length', '-1'))
-        if not 0 <= size <= 16384 or 'transfer-encoding' in values:
-            raise RegistrationError('Invalid registration response framing')
+        progress_read = (method == 'GET' and token is not None and code == 200
+                         and re.fullmatch(r'/progress/[1-9][0-9]{0,19}', path))
+        limit = 2 * 1024 * 1024 if progress_read else 16384
+        if not 0 <= size <= limit or 'transfer-encoding' in values:
+            raise RegistrationError('Invalid registration response framing', stage='response-framing')
         raw = await asyncio.wait_for(reader.readexactly(size), 5)
         if code == 401:
             return None
         if code == 409:
-            raise RegistrationError('Account already registered. Restore its account-auth.json or ask the administrator for recovery; no progress was reset.')
+            raise RegistrationError('Account already registered. Restore its account-auth.json or ask the administrator for recovery; no progress was reset.', stage='http-response', http_status=code)
         if code != 200:
-            raise RegistrationError('Account service unavailable; registration will retry on the next launch')
+            raise RegistrationError('Account service unavailable; registration will retry on the next launch', stage='http-response', http_status=code)
         return json.loads(raw)
     finally:
         await close(writer)
@@ -156,7 +162,19 @@ def main():
     from steam_identity import Identity
     try:
         with Identity(paths.GAME_EXE.parent/'steam_api64.dll') as identity:
-            result = ensure(identity, settings())
+            options = settings()
+            # Import only the current user's own existing official installation credential,
+            # never a local profile, game state or a credential for a different account.
+            source = os.environ.get('ROI_OFFICIAL_CLIENT')
+            if source and not (HERE/'account-auth.json').exists():
+                other = read_credential(Path(source)/'tools/account-auth.json')
+                if other is None or other['uid'] != identity.uid:
+                    raise RegistrationError('Official installation belongs to another account')
+                validate_status(asyncio.run(exchange(options,'GET','/registration/'+identity.uid,other['token'])),identity.uid)
+                private_create(HERE/'account-auth.json',other)
+            result = ensure(identity, options)
+            if result.get('progression') != 'server':
+                raise RegistrationError('Live progression is not enabled for this account')
         from match_lamina import restore
         if result.get('progression')=='server':
             restore(read_credential(HERE/'account-auth.json'),settings(),exchange)
@@ -164,6 +182,7 @@ def main():
               else 'Account authenticated; progression is server-owned.')
     except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
         # Never include transport exception strings, which might contain a ticket.
+        print('For an existing account, set ROI_OFFICIAL_CLIENT to your own official install folder and retry.', file=sys.stderr)
         print('Account registration/login failed. Check Steam and connectivity. Keep account-auth.pending.json for a safe retry; do not delete existing account-auth.json.', file=sys.stderr)
         return 1
     return 0

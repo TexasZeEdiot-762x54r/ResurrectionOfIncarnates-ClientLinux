@@ -52,6 +52,9 @@ def supported(name, data):
     empty_reply(name, data)
     if name == 'getCharaUsageRanking':
         return data.get('sv_period') == 1
+    if name == 'getTagRanking':
+        return (data['sv_filter'] in (0,2,3) and 1 <= data['sv_period'] <= 5
+                and 1 <= data['sv_start'] <= 10000 and 1 <= data['sv_range'] <= 100)
     # 0x1403ec570: controller mode 0 = Wins/Win %, mode 1 = Rank Point/Wins.
     # 0x1403eca20 maps those modes to types 1 and 2; visual page order differs.
     # Overall period index 0 maps to period 1.
@@ -108,6 +111,36 @@ def validate_response(name, data, result):
     rows = result['ranking']
     if not isinstance(rows, list) or len(rows) > min(data['sv_range'], total):
         raise ValueError('Invalid ranking page')
+    if name == 'getTagRanking':
+        seen = set()
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {
+                    'sv_no', 'sv_rank', 'sv_point', 'sv_tagId', 'sv_freeTagName', 'sv_paidTagName', 'sv_tagPlayers'}:
+                raise ValueError('Invalid team ranking row')
+            for key in ('sv_no', 'sv_rank'):
+                number(row[key], 10000, 1)
+            number(row['sv_point'], 2**31-1, 1)
+            tag = number(row['sv_tagId'], 2**63-1, 1)
+            if tag in seen:raise ValueError('Duplicate team')
+            seen.add(tag)
+            for key in ('sv_freeTagName', 'sv_paidTagName'):
+                value = row[key]
+                if not isinstance(value, str) or len(value.encode('utf-8')) > 63 or any(ord(c)<32 for c in value):
+                    raise ValueError('Invalid team name')
+            players = row['sv_tagPlayers']
+            if not isinstance(players, list) or len(players) != 2:
+                raise ValueError('Invalid team members')
+            ids = set()
+            for player in players:
+                if not isinstance(player, dict) or set(player) != {'sv_onlineId', 'sv_charaId', 'sv_userName'}:
+                    raise ValueError('Invalid team member fields')
+                ids.add(number(player['sv_onlineId'], 2**64-1, 1))
+                number(player['sv_charaId'], 21, 1)
+                value = player['sv_userName']
+                if not isinstance(value, str) or len(value.encode('utf-8')) > 127 or any(ord(c)<32 for c in value):
+                    raise ValueError('Invalid team player name')
+            if len(ids) != 2:raise ValueError('Duplicate team member')
+        return result
     circle_view = name == 'getCircleRanking'
     rank_points_view = name in ('getRankmatchRanking', 'getCircleRanking') and data.get('sv_type') == 2
     streak_view = name == 'getRankmatchRanking' and data.get('sv_type') == 3

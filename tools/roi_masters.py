@@ -84,9 +84,17 @@ def charalevel_master():
 
 
 def rank_master():
-    # 14 ranks (hud/sequence/record/TEX/Record_Character_Rank_01..14) plus an entry for index 0
-    return [{"sv_upPoint": S(100 * (i + 1)), "sv_downPoint": S(0 if i == 0 else 100 * i), "sv_downRatio": "0"}
-            for i in range(15)]
+    import ranked_policy as policy
+    # Native UI indexes this table by the one-based displayed rank.
+    rows = [{"sv_upPoint": "0", "sv_downPoint": "0", "sv_downRatio": "0"}]
+    for rank in range(1, policy.MAX_RANK + 1):
+        lower = policy.down_threshold(rank)
+        if lower is None:
+            lower = policy.up_threshold(rank - 1) if rank > 1 else 0
+        upper = policy.up_threshold(rank)
+        rows.append({"sv_upPoint": S(upper if upper is not None else policy.MAX_POINTS),
+                     "sv_downPoint": S(lower), "sv_downRatio": "0"})
+    return rows
 
 
 def matching_range_master():
@@ -134,22 +142,17 @@ def skillcube_master():
     with profile_store.LOCK:
         importlib.reload(roi_skill_catalogue)
         importlib.reload(roi_skills)
-        saved = roi_server_data.saved()
-        if roi_skills.enabled(saved):
-            return roi_skills.master(saved)
-    return [{"_id": "1", "sv_skillcubeId": "1", "sv_skillcubeIconId": "1", "sv_skillcubeRank": "1",
-             "sv_skillcubeShape": "1", "sv_skillcubeName": "0", "sv_skillcubeDesc": "0", "sv_skillcubeRarityId": "1",
-             "sv_effects": [], "sv_cobeCount": "1", "sv_skillcubePrice": "0", "sv_skillcubeStatus": "0",
-             "sv_skillcubeCategory": "0", "sv_sort": "1"}]
+        # Battles run in lockstep and every machine applies every player's cubes, so every client must
+        # define every cube identically, whatever its own (often near-empty local) profile holds. On
+        # 2026-11-15 the laptop served 1 definition and the desktop 619, and another player's 20x cube
+        # had no effect on the laptop, so the battle aborted. Ownership is gated in inventory/shop.
+        return roi_skills.definitions()
 
 
 def skillcubelevel_master():
-    import roi_server_data
+    # Same reason: level data must not depend on the local profile.
     import roi_skill_catalogue
-    if roi_skill_catalogue.enabled(roi_server_data.saved()):
-        return roi_skill_catalogue.base_level_rows()
-    return [{"sv_rank": "1", "sv_level": S(lv), "sv_totalExp": S((lv - 1) * 100), "sv_gainExp": "10",
-             "sv_triggerLimit": "0"} for lv in range(1, 11)]
+    return roi_skill_catalogue.base_level_rows()
 
 
 def store_item_master():

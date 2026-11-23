@@ -174,7 +174,7 @@ def request(url, token, data=None):
     req = urllib.request.Request(url, data=body, headers=headers, method='PUT' if body is not None else 'GET')
     # Never send a private WireGuard credential through a machine's configured HTTP proxy.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open(req, timeout=3 if body is not None else 1.5) as response:
+    with opener.open(req, timeout=3) as response:
         if body is not None:
             return None
         out = response.read(MAX_BODY + 1)

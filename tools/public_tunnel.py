@@ -8,7 +8,7 @@ import sys
 
 HERE=Path(__file__).resolve().parent
 sys.path.insert(0,str(HERE))
-from tls_transport import CHANNELS,HEALTH,Limits,bridge,close,pinned_connection
+from tls_transport import CHANNELS,HEALTH,bridge,close,pinned_connection
 
 
 def settings():
@@ -36,6 +36,14 @@ async def check(options):
         await close(writer)
 
 
+async def acquire_admission(admission):
+    queued=admission.locked()
+    if queued:
+        print('public tunnel: local admission limit reached; connection queued',flush=True)
+    await admission.acquire()
+    return queued
+
+
 async def run(options, trace_ranked=False):
     await check(options)
     from roi_account_client import read_credential
@@ -44,28 +52,34 @@ async def run(options, trace_ranked=False):
     account=read_credential(HERE/'account-auth.json')
     if account is None or roi_progression_client.credential(account['uid'])!=account['token']:
         raise ValueError('Run the account registration launcher first')
+    build = b''
+    if options[0] == 'riseofincarnates.artificerreviver.com':
+        from match_build import fingerprint
+        build = fingerprint()
     trace = None
     if trace_ranked:
         from ranked_transport_trace import Budget, observe
         trace = Budget(lambda line: print(line, flush=True))
         print('ranked transport trace enabled: numeric shapes only, 10 minutes, 64 records',flush=True)
-    limits=Limits(maximum=24,per_ip=24)
+    # The game can briefly open more than 24 loopback profile connections while
+    # rebuilding adjacent menu screens. Preserve the 24-connection upstream cap,
+    # but queue overflow locally instead of turning it into RemoteDisconnected.
+    admission=asyncio.Semaphore(24)
     async def accept(reader,writer,channel):
         address=writer.get_extra_info('peername')[0]
         if address!='127.0.0.1':
             await close(writer)
             return
-        if not limits.enter(address):
-            print('public tunnel: local admission limit reached; connection deferred',flush=True)
-            await close(writer)
-            return
         remote_writer=None
+        admitted=False
         try:
+            await acquire_admission(admission)
+            admitted=True
             remote,remote_writer=await pinned_connection(*options)
             remote_writer.write(CHANNELS[channel])
             await remote_writer.drain()
             if channel == 'nrt':
-                reader=AuthenticatedReader(reader,account['uid'],account['token'])
+                reader=AuthenticatedReader(reader,account['uid'],account['token'],build)
             if channel == 'nrt' and trace is not None:
                 reader=observe(reader,trace,'request')
                 remote=observe(remote,trace,'reply')
@@ -77,17 +91,27 @@ async def run(options, trace_ranked=False):
         finally:
             await close(remote_writer)
             await close(writer)
-            limits.leave(address)
+            if admitted:
+                admission.release()
     native=await asyncio.start_server(lambda r,w:accept(r,w,'nrt'),'127.0.0.1',52711,limit=65536,backlog=16)
     try:
-        profile=await asyncio.start_server(lambda r,w:accept(r,w,'profile'),'127.0.0.1',52713,limit=65536,backlog=16)
+        from profile_http_pool import Server
+        import threading
+        profile=Server(options)
     except BaseException:
         native.close()
         await native.wait_closed()
         raise
-    async with native,profile:
-        print('public TLS tunnel ready on loopback 52711/52713',flush=True)
-        await asyncio.gather(native.serve_forever(),profile.serve_forever())
+    thread=threading.Thread(target=profile.serve_forever,daemon=True)
+    thread.start()
+    try:
+        async with native:
+            print('public TLS tunnel ready on loopback 52711/52713; profile pool max2',flush=True)
+            await native.serve_forever()
+    finally:
+        await asyncio.to_thread(profile.shutdown)
+        profile.server_close()
+        thread.join(timeout=2)
 
 
 if __name__=='__main__':

@@ -20,8 +20,10 @@ OPEN, SUMMON, USED = 0x14069AA70, 0x14069AAC0, 0x14069AAD0
 PARAM = 0x14069AAE0
 NATIVE_SUMMON = 0x140640540
 CREATED_RETURN = 0x1406405BF
+FACTORY_RET = CREATED_RETURN + 15
 INITIALIZED = 0x140520D65
 MENU_SCENE = 0x140162BF0
+RESULTS_READY = 0x140103620
 TARGET_SET, TARGET_VALID = 0x14059E310, 0x14059E320
 LIFETIME_RETURN = 0x1405330B7
 LOA_SHOT_RETURN = 0x1405092D7
@@ -161,13 +163,18 @@ class SummonRecorder:
 
 
 def native_gate(budget, roster=ROSTER, playback=PLAYBACK, registry=REGISTRY, *, used=False,
-                parameter=False):
+                parameter=False, counters=None):
     """Win64 leaf: RCX=wrapper, EAX=bool; only volatile GPRs/flags clobbered.
 
     Addresses are injectable for isolated machine-code tests. Native object
     lifetime remains the engine's responsibility; null checks cannot validate
     a dangling non-null pointer. No calls, stack writes, or debugger crossings.
     Parameter mode consumes EDX=index/XMM2=value and writes only owner+C2A0.
+
+    counters (diagnostic, OPEN only): address of eight u32 counters. counters[slot] counts
+    calls that reach the slot check for that player slot (local or not); counters[4+slot]
+    counts calls that pass every check. The only memory the gate then writes besides the
+    parameter field; RCX is clobbered after its last use.
     """
     code, branches = bytearray(), []
 
@@ -197,7 +204,9 @@ def native_gate(budget, roster=ROSTER, playback=PLAYBACK, registry=REGISTRY, *, 
     emit('4d 85 c0'); reject('84')
     imm64('48 b8', roster)
     emit('4c 8b 08 4d 85 c9'); reject('84')   # r9 = *roster
-    emit('41 83 b9 50 f6 05 00 05'); reject('85')
+    emit('41 8b 81 50 f6 05 00')            # eax = battle mode
+    emit('83 f8 05'); reject('87')           # unsigned mode > 5 fails
+    emit('ba 3b 00 00 00 0f a3 c2'); reject('83')  # Ranked solo 0/team 1, custom 3/4, Vs. Bot 5
     emit('41 80 79 10 00'); reject('85')
     imm64('48 b8', playback)
     emit('4c 8b 10 4d 85 d2'); reject('84')   # r10 = *playback
@@ -205,11 +214,14 @@ def native_gate(budget, roster=ROSTER, playback=PLAYBACK, registry=REGISTRY, *, 
     emit('41 81 7a 10 f0 05 03 15'); reject('85')
     emit('41 0f be 90 71 0c 00 00')           # edx = signed player slot
     emit('83 fa 03'); reject('87')           # unsigned >3 includes negatives
-    emit('41 3a 52 14'); reject('85')
+    if counters is not None:
+        imm64('48 b9', counters)              # rcx = counters (wrapper no longer needed)
+        emit('f0 ff 04 91')                   # lock inc dword [rcx+rdx*4]
     imm64('48 b8', registry)
     emit('4c 8b 18 4d 85 db'); reject('84')   # r11 = *registry
     emit('48 69 c2 d0 25 00 00')              # rax = slot * 0x25d0
     emit('4d 39 44 03 18'); reject('85')      # registered player identity
+    emit('41 83 bc 03 d4 23 00 00 01'); reject('85')  # human controller; CPUs are 4
     emit('4d 39 80 58 0c 00 00'); reject('85')
     emit('49 8d 80 f0 0b 00 00')
     emit('49 39 80 60 0c 00 00'); reject('85')
@@ -238,12 +250,68 @@ def native_gate(budget, roster=ROSTER, playback=PLAYBACK, registry=REGISTRY, *, 
         emit('00'); reject('85')
     if parameter:
         emit('f3 41 0f 11 90 a0 c2 00 00')  # only the local owner's shot field
+    if counters is not None:
+        imm64('48 b9', counters + 16)          # rcx = eligible counters; edx still holds slot
+        emit('f0 ff 04 91')                   # lock inc dword [rcx+rdx*4]
     emit('b8 ' + ('00' if used or parameter else '01') + ' 00 00 00 c3')
     failure = len(code)
     emit('b8 ' + ('01' if used else '00') + ' 00 00 00 c3')
     for at in branches:
         struct.pack_into('<i', code, at, failure - (at + 4))
     return bytes(code)
+
+
+GATE_MODES = (0, 1, 3, 4, 5)
+# Diagnostic OPEN-gate call counters live in the last 64 bytes of the 8 KiB gate allocation.
+COUNTERS_OFFSET = 8192 - 64
+OPEN_COUNTERS = None  # set once the gates are installed
+
+
+def read_open_counters(d):
+    """(calls per slot, eligible per slot) from the native OPEN gate, or None before arming."""
+    if OPEN_COUNTERS is None:
+        return None
+    raw = d.read(OPEN_COUNTERS, 32)
+    if len(raw) != 32:
+        return None
+    values = struct.unpack('<8I', raw)
+    return list(values[:4]), list(values[4:])
+
+
+def gate_conditions(d, wrapper, budget):
+    """Read-only mirror of native_gate's checks, for logging which one fails."""
+    out = {}
+
+    def take(name, read_value):
+        try:
+            out[name] = read_value()
+        except Exception:
+            out[name] = 'unreadable'
+
+    player = number(d, wrapper + 0xEF8, '<Q') if wrapper else 0
+    roster, playback, registry = (number(d, a, '<Q') for a in (ROSTER, PLAYBACK, REGISTRY))
+    take('budget', lambda: number(d, budget, '<B'))
+    take('mode', lambda: number(d, roster + 0x5F650))
+    out['mode_allowed'] = out.get('mode') in GATE_MODES
+    take('roster_flag', lambda: number(d, roster + 0x10, '<B'))
+    take('replay', lambda: number(d, playback + 8, '<B'))
+    take('header_ok', lambda: number(d, playback + 0x10) == 0x150305F0)
+    take('slot', lambda: number(d, player + 0xC71, '<b'))
+    take('header_slot', lambda: number(d, playback + 0x14, '<B'))
+    take('registered', lambda: 0 <= out['slot'] < 4 and number(
+        d, registry + out['slot'] * 0x25D0 + 0x18, '<Q') == player)
+    take('controller', lambda: number(d, registry + out['slot'] * 0x25D0 + 0x23D4))
+    out['human_controller'] = out.get('controller') == 1
+    take('owner_links', lambda: number(d, player + 0xC58, '<Q') == player
+         and number(d, player + 0xC60, '<Q') == player + 0xBF0)
+    take('character', lambda: number(d, player + 0xC74))
+    take('lamina', lambda: number(d, player + 0xC78))
+    take('level', lambda: number(d, player + 0x5611, '<B'))
+    take('hp_positive', lambda: 0 < number(d, player + 0xC88, '<i') < 0x7F800000)
+    take('actor_slots_used', lambda: [bool(number(d, player + 0xC288, '<Q')),
+                                      bool(number(d, player + 0xC290, '<Q'))])
+    take('active_flags', lambda: [number(d, player + 0xC298), number(d, player + 0xC29C)])
+    return out
 
 
 def gate_jump(target):
@@ -304,16 +372,21 @@ def checked_write(d, address, raw):
 
 
 def allowed_environment(exe, module, config, enabled):
-    """Pure policy check; callers supply resolved paths to reject junctions."""
+    """Compare the generated game path in the same Windows namespace as the hook."""
+    from cachyos_paths import native_path
+    try:
+        game = native_path(config.get('game', ''), windows=True)
+    except ValueError:
+        return False
     return (enabled is True
             and PureWindowsPath(exe) == ROOT / 'game/exe/roi.exe'
             and PureWindowsPath(module) == ROOT / 'tools/sessions/lamina_combat.py'
-            and PureWindowsPath(config.get('game_windows',config.get('game',''))) == ROOT / 'game'
+            and PureWindowsPath(game) == ROOT / 'game'
             and config.get('lobby_mode') == 'server'
             and config.get('lobby_transport') == 'tls-public'
             and config.get('lobby_server') == '127.0.0.1:52711'
             and config.get('lobby_listen') == '127.0.0.1'
-            and config.get('release_mode') in ('vpn','internet','lan') and bool(config.get('public_lobby_host')))
+            and config.get('public_lobby_host') == 'riseofincarnates.artificerreviver.com' and not config.get('lobby_token'))
 
 
 def environment(d):
@@ -360,6 +433,10 @@ def loa_load_error(d, script):
         return ''
 
 
+class ScriptPoolBusy(ValueError):
+    pass
+
+
 class HandStillActive(ValueError):
     pass
 
@@ -380,7 +457,7 @@ def script_contexts(d, lamina, *, child=False):
     if number(d, manager, '<Q') != 0x141900B68:
         raise ValueError('unknown script pool vtable')
     if number(d, manager + 0x38):
-        raise ValueError('script pool is busy')
+        raise ScriptPoolBusy('script pool is busy')
     head = pointer(d, manager + 0x48)
     count = number(d, manager + 0x50, '<Q')
     if count > 4096 or number(d, head + 0x41, '<B') != 1:
@@ -579,31 +656,56 @@ def script_bootstrap(pool=SCRIPT_POOL, allocate=0x1407B7160,
     return bytes(code)
 
 
-def preflight(d, wrapper, *, require_idle=True):
+def ranked_result_cpu(d, playback, slot):
+    if not 0 <= slot < 4 or number(d, playback + 0x10) != 0x150305F0:
+        return False
+    retained = playback + 0x30 + slot * 0x22D8
+    if number(d, retained + 1, '<b') < 0:
+        return True
+    # The confirmed briefing row survives controller replacement in the cutscene.
+    state = pointer(d, 0x141B87440)
+    side = number(d, retained + 9, '<B')
+    if side not in (0, 1):
+        return False
+    team = state + side * 0x3CB58
+    if number(d, team + 0x94) != 2:
+        return False
+    for i in range(2):
+        row = team + 0x98 + i * 0xF2C8
+        if (number(d, row + 2, '<B') == slot and number(d, row + 9, '<B') == side
+                and number(d, row + 0x18, '<Q') == number(d, retained + 0x18, '<Q')):
+            return number(d, row + 1, '<b') < 0
+    return False
+
+
+def preflight(d, wrapper, *, require_idle=True, allow_result_presentation=False):
     """Read-only evidence of eligibility, not a guarantee resources will load."""
-    import release_lamina
-    if not release_lamina.allowed():
-        raise ValueError("Lamina locked by progression")
     player = pointer(d, wrapper + 0xEF8)
     roster, playback = pointer(d, ROSTER), pointer(d, PLAYBACK)
-    if number(d, roster + 0x5F650) != 5:
-        raise ValueError('only Vs. Bot mode 5 is permitted')
+    mode = number(d, roster + 0x5F650)
+    if mode not in GATE_MODES:
+        raise ValueError('only Ranked modes 0/1, custom modes 3/4 or Vs. Bot mode 5 are permitted')
     if number(d, playback + 8, '<B') != 0:
         raise ValueError('replay is forbidden')
     if number(d, playback + 0x10) != 0x150305F0:
         raise ValueError('battle header unavailable')
     slot = number(d, player + 0xC71, '<b')
-    if not 0 <= slot < 4 or slot != number(d, playback + 0x14, '<B'):
-        raise ValueError('not the local player')
+    header_slot = number(d, playback + 0x14, '<B')
+    if not 0 <= slot < 4:
+        raise ValueError('invalid player slot %d' % slot)
     registry = pointer(d, REGISTRY)
     if pointer(d, registry + slot * 0x25D0 + 0x18) != player:
         raise ValueError('player is not registered')
+    controller = number(d, registry + slot * 0x25D0 + 0x23D4)
+    presentation = allow_result_presentation
+    if controller != 1 and not (presentation and controller == 0):
+        raise ValueError('player slot %d is not human-controlled' % slot)
     if pointer(d, player + 0xC58) != player or pointer(d, player + 0xC60) != player + 0xBF0:
         raise ValueError('owner links are incomplete')
     if not 1 <= number(d, player + 0xC74) <= 21:
         raise ValueError('invalid player character')
     hp = number(d, player + 0xC88, '<f')
-    if not math.isfinite(hp) or hp <= 0:
+    if not math.isfinite(hp) or hp < 0 or (not presentation and hp == 0):
         raise ValueError('player is not alive')
     if number(d, roster + 0x10, '<B') != 0:
         raise ValueError('native ID-6 override mode is excluded')
@@ -634,11 +736,40 @@ def preflight(d, wrapper, *, require_idle=True):
     # Detect selection/owner replacement while gathering the snapshot.
     if pointer(d, wrapper + 0xEF8) != player or number(d, player + 0xC78, '<i') != lamina:
         raise ValueError('player selection changed during inspection')
-    return dict(player=player, slot=slot, lamina=lamina, level=level)
+    return dict(player=player, slot=slot, lamina=lamina, level=level,
+                local_owner=slot == header_slot, presentation=presentation)
+
+
+def result_owner(d, wrapper):
+    """Return a round-bound visual owner, never infer entitlement from an actor's default."""
+    import match_lamina
+    import release_lamina
+    player = pointer(d, wrapper + 0xEF8)
+    play = pointer(d, PLAYBACK)
+    slot = number(d, player + 0xC71, '<b')
+    if (not 0 <= slot < 4 or number(d, play + 8, '<B')
+            or number(d, play + 0x10) != 0x150305F0):
+        return None
+    own = number(d, play + 0x14, '<B')
+    uid = number(d, play + 0x48 + slot * 0x22D8, '<Q')
+    selection = number(d, player + 0xC78, '<i'), number(d, player + 0x5611, '<b')
+    if not 1 <= selection[0] <= 15 or not 0 <= selection[1] <= 2:
+        return None
+    mode = number(d, pointer(d, ROSTER) + 0x5F650)
+    if mode not in GATE_MODES or (mode in (0,1) and ranked_result_cpu(d, play, slot)):
+        return None
+    expected = match_lamina.presentation_choice(uid) if uid else None
+    if slot == own:
+        if not release_lamina.allowed() or (expected is not None and expected != selection):
+            return None
+    elif expected != selection:
+        return None
+    return (slot, uid, player, selection)
 
 
 def confirm_created(d, attempt):
-    values = preflight(d, attempt['wrapper'], require_idle=False)
+    values = preflight(d, attempt['wrapper'], require_idle=False,
+                       allow_result_presentation=attempt.get('presentation', False))
     if any(values[k] != attempt[k] for k in values):
         raise ValueError('native return does not match dispatched player/selection')
     player, lamina, level = values['player'], values['lamina'], values['level']
@@ -884,22 +1015,60 @@ def setup(d):
         griffin = [None]
         griffin_handlers, griffin_returns = {}, {}
         launch_id = 'launch.' + uuid.uuid4().hex
+        result_ready = [False]
+        result_skips = [0]
+        visual_waiting = {}
+        deferred_visual = {}
+        factory_frames = {}
 
         def inspect(hit):
-            return preflight(debugger, hit.rcx)
+            return preflight(debugger, hit.rcx,
+                             allow_result_presentation=result_ready[0])
 
         def summon(hit):
             started = time.perf_counter()
             try:
                 saved_events(debugger)
+                if result_ready[0]:
+                    try:
+                        owner = result_owner(debugger, hit.rcx)
+                    except READ_ERRORS:
+                        owner = None
+                    if owner is None:
+                        hit.skip_call(0)
+                        debugger.log('LAMINA_RESULT skipped: no eligible player selection')
+                        return
+                    busy = pending[0] or loading[0]
+                    if busy:
+                        if (busy.get('presentation') and owner[2] != busy['player']
+                                and owner[2] not in visual_waiting and not deferred_visual):
+                            deferred_visual['next'] = (hit.rcx, owner)
+                            debugger.log(f'LAMINA_RESULT queued teammate slot={owner[0]}')
+                        hit.skip_call(0)
+                        return
                 # A closed gate also protects an in-flight attempt from duplicate callbacks.
-                if number(debugger, budget, '<B') != 1:
+                values = None
+                if (number(debugger, budget, '<B') != 1 and result_ready[0]
+                        and len(visual_waiting) == 1 and pending[0] is None
+                        and loading[0] is None and initializing[0] is None):
+                    candidate = inspect(hit)
+                    if candidate['presentation'] and candidate['player'] not in visual_waiting:
+                        values = candidate
+                if values is None and number(debugger, budget, '<B') != 1:
                     hit.skip_call(0)
+                    if result_ready[0] and result_skips[0] < 8:
+                        result_skips[0] += 1
+                        try:
+                            actor = pointer(debugger, hit.rcx + 0xEF8)
+                            slot = number(debugger, actor + 0xC71, '<b')
+                        except Exception:
+                            slot = 'unknown'
+                        debugger.log(f'LAMINA_RESULT closed summon gate slot={slot}')
                     return
                 if not environment(debugger):
                     checked_write(debugger, budget, b'\0')
                     raise ValueError('experimental opt-in or isolation was removed')
-                values = inspect(hit)
+                values = values or inspect(hit)
                 checked_write(debugger, budget, b'\0')
                 resources = [(values['lamina'], 2 if values['lamina'] == 3 else 1)]
                 if values['lamina'] == 4:
@@ -908,14 +1077,22 @@ def setup(d):
                     resources.append((IFRIT_CHILD, 4))
                 # In-use hands may still be finishing the previous firing cycle.
                 # Do not consume the retry gate or register duplicates in that case.
-                pools = [(key, required, script_contexts(debugger, key, child=key in CHILD_ROWS))
-                         for key, required in resources]
+                try:
+                    pools = [(key, required, script_contexts(debugger, key, child=key in CHILD_ROWS))
+                             for key, required in resources]
+                except ScriptPoolBusy:
+                    # No factory or loader has started: only this combat attempt is deferred.
+                    if not values['presentation']:
+                        checked_write(debugger, budget, b'\x01')
+                    raise
                 # Results scripts also call this stub for non-local actors. Reject
                 # those before acquiring the gate shared with the next battle.
                 # Once accepted, reopen only after successful initialization.
                 sequence[0] += 1
                 attempt = dict(values, wrapper=hit.rcx, tid=hit.tid,
                                event_id=f'native.{sequence[0]}')
+                if attempt['presentation']:
+                    factory_frames.setdefault((hit.tid, hit.rsp), None)
                 attempt['missing'] = [(key, required, contexts) for key, required, contexts
                                       in pools if len(contexts) < required]
                 if values['lamina'] == 4:
@@ -928,10 +1105,15 @@ def setup(d):
                     checked_write(debugger, budget, b'\x01')
                 pending[0] = None
                 loading[0] = None
-                hit.skip_call(0)
+                original = factory_frames.pop((hit.tid, hit.rsp), None)
+                hit.skip_call(0 if original is None else original)
                 if log_budget[0]:
                     log_budget[0] -= 1
                     debugger.log(f'LAMINA_COMBAT summon rejected: {exc}')
+                    try:
+                        debugger.log('LAMINA_GATE rejected ' + json.dumps(gate_conditions(debugger, hit.rcx, budget)))
+                    except Exception as gate_exc:
+                        debugger.log(f'LAMINA_GATE report unavailable: {gate_exc}')
             finally:
                 elapsed = (time.perf_counter() - started) * 1000
                 if elapsed >= 5:
@@ -975,7 +1157,8 @@ def setup(d):
             try:
                 if not environment(debugger):
                     raise ValueError('experimental isolation was removed')
-                values = preflight(debugger, attempt['wrapper'])
+                values = preflight(debugger, attempt['wrapper'],
+                                   allow_result_presentation=attempt['presentation'])
                 if any(values[k] != attempt[k] for k in values):
                     raise ValueError('selection changed during script loading')
                 key = attempt['resource']
@@ -996,8 +1179,33 @@ def setup(d):
                     debugger.log(f"LAMINA_COMBAT ID {key} scripts ready in native pool")
                     advance(hit, attempt)
             except READ_ERRORS as exc:
-                hit.skip_call(0)
+                original = factory_frames.pop((hit.tid, hit.rsp), None)
+                deferred_visual.clear()
+                hit.skip_call(0 if original is None else original)
                 debugger.log(f'LAMINA_COMBAT script bootstrap rejected: {exc}')
+
+        def factory_return(hit):
+            frame = (hit.tid, hit.rsp)
+            if frame not in factory_frames:
+                hit.skip_call(hit.rax)
+                return
+            original = factory_frames.pop(frame)
+            value = hit.rax if original is None else original
+            request = deferred_visual.pop('next', None)
+            if request and result_ready[0] and not (loading[0] or pending[0] or initializing[0]):
+                wrapper, expected = request
+                try:
+                    if result_owner(debugger, wrapper) == expected and environment(debugger):
+                        # The first native call has unwound. Reuse its normal factory
+                        # call frame, then return the first result to its real caller.
+                        preflight(debugger, wrapper, allow_result_presentation=True)
+                        factory_frames[frame] = value
+                        hit.setreg('rcx', wrapper)
+                        hit.setreg('rip', SUMMON)
+                        return
+                except READ_ERRORS as exc:
+                    debugger.log(f'LAMINA_RESULT deferred owner unavailable: {exc}')
+            hit.skip_call(value)
 
         def created(hit):
             started = time.perf_counter()
@@ -1009,13 +1217,17 @@ def setup(d):
                 if not environment(debugger):
                     raise ValueError('experimental isolation was removed')
                 actors = confirm_created(debugger, attempt)
-                initializing[0] = dict(attempt, actors=actors)
+                verified = dict(attempt, actors=actors)
+                if attempt['presentation']:
+                    visual_waiting[attempt['player']] = verified
+                else:
+                    initializing[0] = verified
                 if attempt['lamina'] == 10:
                     salamander_watch[0] = dict(attempt, actor=actors[0])
                 elif attempt['lamina'] == 4:
                     loa_watch[0] = dict(attempt, actor=actors[0], samples=0, initialized_hands=0)
                 debugger.log('LAMINA_COMBAT actor allocation confirmed; waiting for initialization')
-                finish_initialization(initializing[0], started)
+                finish_initialization(verified, started)
             except READ_ERRORS as exc:
                 debugger.log(f'LAMINA_COMBAT actor confirmation failed: {exc}')
             finally:
@@ -1025,10 +1237,11 @@ def setup(d):
 
         def initialized(hit):
             started = time.perf_counter()
-            attempt = initializing[0] or pending[0]
+            actor = hit.rdi - 0xBF0
+            attempt = next((item for item in visual_waiting.values() if actor in item['actors']),
+                           initializing[0] or pending[0])
             if attempt is None:
                 return
-            actor = hit.rdi - 0xBF0
             if actor in attempt['completed']:
                 return
             if 'actors' in attempt and actor not in attempt['actors']:
@@ -1062,18 +1275,31 @@ def setup(d):
             if 'actors' not in attempt or set(attempt['completed']) != set(attempt['actors']):
                 return
             try:
-                initializing[0] = None
-                capacity = refill_summon_charges(debugger, attempt)
+                if attempt['presentation']:
+                    visual_waiting.pop(attempt['player'], None)
+                else:
+                    initializing[0] = None
+                capacity = None
                 import roi_lamina
                 store = Path(__file__).resolve().parent.parent / 'lamina_profile.json'
                 expected_store = ROOT / 'tools/lamina_profile.json'
                 if PureWindowsPath(str(store.resolve())) != expected_store:
                     raise ValueError('experimental profile path escaped clone')
-                recorder.submit(roi_lamina.record_summon, store, attempt['lamina'], launch_id,
-                                attempt['event_id'], variant=attempt['level'])
-                checked_write(debugger, budget, b'\x01')
+                if not attempt['presentation']:
+                    capacity = refill_summon_charges(debugger, attempt)
+                if attempt['local_owner'] and not attempt['presentation']:
+                    recorder.submit(roi_lamina.record_summon, store, attempt['lamina'], launch_id,
+                                    attempt['event_id'], variant=attempt['level'])
+                if not visual_waiting and not (pending[0] or loading[0]):
+                    checked_write(debugger, budget, b'\x01')
+                try:
+                    debugger.log('LAMINA_GATE after_init ' + json.dumps(gate_conditions(debugger, attempt['wrapper'], budget)))
+                except Exception as gate_exc:
+                    debugger.log(f'LAMINA_GATE report unavailable: {gate_exc}')
                 debugger.log('LAMINA_COMBAT native initialization returned ' + json.dumps(dict(
-                    actors=attempt['actors'], save_queued=True, event_id=attempt['event_id'],
+                    actors=attempt['actors'],
+                    save_queued=attempt['local_owner'] and not attempt['presentation'],
+                    presentation=attempt['presentation'], event_id=attempt['event_id'],
                     test_charges=capacity,
                     callback_ms=round((time.perf_counter() - started) * 1000, 3),
                     dispatch_to_init_ms=round((started - attempt['dispatch_started']) * 1000, 3))))
@@ -1178,9 +1404,27 @@ def setup(d):
             pending[0] = loading[0] = initializing[0] = None
             salamander_watch[0] = None
             loa_watch[0] = None
+            result_ready[0] = False
+            result_skips[0] = 0
+            visual_waiting.clear()
+            deferred_visual.clear()
+            factory_frames.clear()
+            import match_lamina
+            match_lamina.presentation_round(None)
             enabled = environment(debugger)
             checked_write(debugger, budget, b'\x01' if enabled else b'\0')
             debugger.log(f'LAMINA_COMBAT menu reset enabled={enabled}; no XP for unfinished attempts')
+
+        def open_results_window():
+            if not result_ready[0]:
+                debugger.log('LAMINA_RESULT presentation window opened')
+            result_ready[0] = True
+
+        def results_ready(hit):
+            open_results_window()
+            previous_results_ready(hit)
+
+        debugger.lamina_results_report_ready = open_results_window
 
         def lifetime_return(hit):
             # Native setter ends in RET with RAX=actor. Preserve that return
@@ -1253,6 +1497,7 @@ def setup(d):
                 debugger.log(f'LAMINA_ABAO HUD skipped: {exc}')
 
         handlers = {CREATED_RETURN: persistent_return(CREATED_RETURN, 0x38, created),
+                    FACTORY_RET: factory_return,
                     HUD_TAIL: build_hud,
                     LOA_CHILD_READY: loa_child_ready,
                     LOA_SHOT_RETURN: loa_shot_return,
@@ -1265,9 +1510,12 @@ def setup(d):
         if not budget or not 0x10000 <= budget < 0x7FFFFFF00000:
             debugger.log('LAMINA_COMBAT disabled: native gate allocation failed')
             return
+        global OPEN_COUNTERS
         try:
             checked_write(debugger, budget, b'\0\0')
-            open_code = native_gate(budget)
+            counters = budget + COUNTERS_OFFSET
+            checked_write(debugger, counters, b'\0' * 32)
+            open_code = native_gate(budget, counters=counters)
             used_code = native_gate(budget, used=True)
             open_entry, used_entry = budget + 16, budget + 16 + len(open_code)
             parameter_entry = used_entry + len(used_code)
@@ -1298,9 +1546,10 @@ def setup(d):
             all_code.extend(enemy_gauge_thunk())
             # Range rejection alone breaks native target cycling and AI pursuit.
             # Keep the prototype uninstalled until acquisition/navigation agree.
-            if 16 + len(all_code) > 8192:
+            if 16 + len(all_code) > COUNTERS_OFFSET:
                 raise ValueError('native gates exceed allocation')
             checked_write(debugger, open_entry, bytes(all_code))
+            OPEN_COUNTERS = counters
             for address, handler in handlers.items():
                 installed.append(address)
                 debugger.bp(address, handler)
@@ -1333,9 +1582,14 @@ def setup(d):
         if MENU_SCENE in debugger.bps:
             previous_menu = debugger.bps[MENU_SCENE][1]
             debugger.bps[MENU_SCENE][1] = menu_reset
-        debugger.log('LAMINA_COMBAT armed v14: Dullahan beta teammate damage; native targeting unchanged; '
+        if RESULTS_READY in debugger.bps:
+            previous_results_ready = debugger.bps[RESULTS_READY][1]
+            debugger.bps[RESULTS_READY][1] = results_ready
+        else:
+            debugger.log('LAMINA_COMBAT result presentation disabled: results-ready observer unavailable')
+        debugger.log('LAMINA_COMBAT armed v15: synchronized human-player summons; Dullahan beta teammate damage; native targeting unchanged; '
                      'all 15 script loaders, paired ID3 and bounded ID10 command; '
-                     'experimental local Vs. Bot only; unlimited sequential summons with charge refill; '
+                     'experimental live Ranked and local Vs. Bot; unlimited sequential summons with charge refill; '
                      'static validation only, not a working-combat claim')
 
     d.on_start(arm)

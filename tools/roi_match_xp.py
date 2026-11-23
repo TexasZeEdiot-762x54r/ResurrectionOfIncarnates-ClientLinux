@@ -44,7 +44,8 @@ def baseline(saved, thresholds, cid, rule):
 
 def selected_rule(current, result, native):
     config = current['match_xp']
-    if not config['enabled'] or result not in (-1, 1):
+    if not config['enabled'] or (result not in (-1, 1)
+            and not (result == 0 and current.get('draw_rewards') is True)):
         return None
     highest = summary(native)['highest_damage'] if result == 1 else False
     amount = config['highest_damage_win'] if highest else config['win'] if result == 1 else config['loss']

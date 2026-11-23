@@ -36,7 +36,7 @@ def rename(actor, data):
     actor = uid(actor)
     if not isinstance(data, dict) or type(data.get('sv_isCircle')) not in (int, str):
         raise ValueError('Invalid naming request')
-    if data['sv_isCircle'] not in (0, '0'):
+    if data['sv_isCircle'] not in (0, '0', 1, '1'):
         raise ValueError('Circle naming is not ticket naming')
     partner = uid(data.get('sv_partnerUid'))
     name = data.get('sv_tagName')
@@ -44,13 +44,20 @@ def rename(actor, data):
             or len(name.encode('utf-8')) > 63
             or any(c in '<>' or unicodedata.category(c).startswith('C') for c in name)):
         raise ValueError('Invalid partner or team name')
-    return {'sv_partnerUid': partner, 'sv_isCircle': '0', 'sv_tagName': name}
+    return {'sv_partnerUid': partner, 'sv_isCircle': str(data['sv_isCircle']), 'sv_tagName': name}
 
 
 def operation(value):
     if not isinstance(value, str) or not re.fullmatch(r'[0-9a-f]{32}', value):
         raise ValueError('Invalid operation ID')
     return value
+
+
+def circle_rename(actor,data):
+    if not isinstance(data,dict) or type(data.get('sv_isCircle')) not in (int,str) or data['sv_isCircle'] not in (1,'1'):
+        raise ValueError('Invalid Circle naming request')
+    result=rename(actor,dict(data,sv_isCircle=0))
+    return dict(result,sv_isCircle='1')
 
 
 @contextmanager

@@ -22,7 +22,20 @@ GUARDS = {
 }
 
 
-def eligible(reader, hit):
+ROSTER, PLAYBACK = 0x141B87458, 0x141B874D0
+
+
+def battle_mode(reader):
+    """Return the battle mode, or -1 for a replay. Used for logging only."""
+    if native.number(reader, native.pointer(reader, PLAYBACK) + 8, '<B'):
+        return -1
+    return native.number(reader, native.pointer(reader, ROSTER) + 0x5F650)
+
+
+def eligible(reader, hit, kept=None):
+    """Values for a hit the cube uncaps, else None. Every peer runs this for every attacker, so the
+    decision depends only on the attacker's own loadout and stats. When the attacker carries the cube
+    but the hit stays capped, the reason is appended to `kept` so peers' logs can be compared."""
     if native.number(reader, hit.r13 + 0xA0) != 13:
         return None
     # Special attacks take a different native multiplier branch, even if type 13.
@@ -46,13 +59,21 @@ def eligible(reader, hit):
     melee = native.number(reader, hit.rsi + 0x114E8, '<f')
     value = native.number(reader, hit.rbx, '<f')
     cap = native.number(reader, hit.r14 + 0x11D60, '<f')
+    values = dict(slot=slot, baseline=baseline, melee=melee, before_cap=value, ordinary_cap=cap)
     if not all(math.isfinite(v) for v in (baseline, melee, value, cap)):
+        if kept is not None:
+            kept.append(('non-finite', values))
         return None
     # A depleted/disabled cube has no +19 static effect. Do not infer activity
     # from the retained inventory ID alone or alter older 5x diagnostic replays.
-    if baseline < 19 or melee <= 1 or not 0 < cap < value:
+    if baseline < 19 or melee <= 1:
+        if kept is not None:
+            kept.append(('cube effect inactive', values))
         return None
-    return dict(slot=slot, grid=grid, melee=melee, before_cap=value, ordinary_cap=cap)
+    if not 0 < cap < value:
+        return None  # Under the cap already: nothing to uncap.
+    values['grid'] = grid
+    return values
 
 
 def setup(d, enabled=None):
@@ -72,16 +93,31 @@ def setup(d, enabled=None):
             debugger.log('DIAGNOSTIC_MELEE disabled: breakpoint already owned')
             return
         logged = 0
+        kept_logged = 0
+        modes = set()
 
         def before_cap(hit):
-            nonlocal logged
+            nonlocal logged, kept_logged
             try:
-                values = eligible(debugger, hit)
+                try:
+                    mode = battle_mode(debugger)
+                except (OSError, ValueError, TypeError, AttributeError, struct.error):
+                    mode = None
+                if mode not in modes:
+                    # Applies in every mode; every peer must run this same release so they agree.
+                    modes.add(mode)
+                    debugger.log(f'DIAGNOSTIC_MELEE active (mode {mode})')
+                kept = []
+                values = eligible(debugger, hit, kept)
                 if values is None:
+                    if kept and kept_logged < 12:
+                        reason, detail = kept[0]
+                        debugger.log(f'DIAGNOSTIC_MELEE kept cap ({reason}) mode {mode} {detail}')
+                        kept_logged += 1
                     return
                 hit.setreg('rip', RESUME)
                 if logged < 12:
-                    debugger.log(f'DIAGNOSTIC_MELEE uncapped {values}')
+                    debugger.log(f'DIAGNOSTIC_MELEE uncapped mode {mode} {values}')
                     logged += 1
             except (OSError, ValueError, TypeError, AttributeError, struct.error):
                 return  # Incomplete/unknown state retains native behavior.

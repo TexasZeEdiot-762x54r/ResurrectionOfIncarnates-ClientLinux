@@ -107,7 +107,7 @@ def setup(args):
     (TOOLS/'public-lobby.json').write_text(json.dumps(dict(internet_host=host,lan_host=host,port=args.port,
                                           certificate_sha256=pin)),encoding='utf-8')
     (ROOT/'.cachyos-ready.json').write_text(json.dumps(dict(patched_sha256=digest(game/'exe/roi.exe'))))
-    print('Experimental assets installed.' + (' Test account login with python tools/lan_login.py; native LAN battle transport is not enabled.'
+    print('Official release assets installed.' + (' Test account login with python tools/lan_login.py; native LAN battle transport is not enabled.'
           if args.mode=='lan' else ' Keep Steam signed in for this profile.'))
 
 
@@ -120,7 +120,7 @@ if __name__=='__main__':
     g.add_argument('--base',type=Path)
     p.add_argument('--host')
     p.add_argument('--pin')
-    p.add_argument('--port',type=int,choices=range(1024,65536),metavar='PORT',default=52714)
+    p.add_argument('--port',type=int,choices=range(1024,65536),metavar='PORT',default=52715)
     try:
         setup(p.parse_args())
     except (OSError,ValueError) as exc:

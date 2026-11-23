@@ -24,8 +24,10 @@ CONNECTION_IDLE_SECONDS=4  # The relay closes HTTP connections after five idle s
 
 class Unavailable(RuntimeError):pass
 
+class TemporaryStoreFailure(Unavailable):pass
+
 class ResponseError(Exception):
-    def __init__(self,code):self.code=code
+    def __init__(self,code,source='unknown'):self.code=code;self.source=source
 
 def exchange(target,uid,token,body,timeout,fresh=False):
     """Two bounded HTTP/1.1 streams share the already-pinned loopback tunnel."""
@@ -49,7 +51,7 @@ def exchange(target,uid,token,body,timeout,fresh=False):
             headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'})
         response=connection.getresponse();raw=response.read(2*1024*1024+1)
         if len(raw)>2*1024*1024:raise ValueError('Progression response too large')
-        if response.status!=200:raise ResponseError(response.status)
+        if response.status!=200:raise ResponseError(response.status,'broker' if response.getheader('X-ROI-Broker-Error')=='1' else 'upstream')
         if response.will_close:connection.close();connection=None
         if connection is not None:connection._roi_last_used=time.monotonic()
         return raw
@@ -79,7 +81,7 @@ def credential(uid):
         if not isinstance(config,dict):raise ValueError('Invalid configuration')
     except (OSError,ValueError):raise Unavailable('Account server configuration unavailable') from None
     if (config.get('lobby_transport')!='tls-public'
-            or config.get('release_mode') not in ('vpn','internet','lan')
+            or value['issuer']!='riseofincarnates.artificerreviver.com'
             or config.get('public_lobby_host')!=value['issuer']):
         raise Unavailable('Account credential belongs to a different server')
     return value['token']
@@ -108,14 +110,16 @@ def request(url,uid,token,payload=None):
     body=json.dumps(payload,separators=(',',':')).encode() if payload is not None else None
     if body is not None and len(body)>128*1024:raise ValueError('Progression request too large')
     timeouts=((0.8,2.0) if payload is not None and payload.get('action')=='nativeLP'
-              else (6.0,6.0) if payload is not None else (0.8,2.0))
+              else (6.0,6.0) if payload is not None else (3.0,6.0))
     for attempt,timeout in enumerate(timeouts):
         try:
             raw=exchange(target,uid,token,body,timeout,fresh=attempt>0)
             value=validate(json.loads(raw),uid,reply=payload is not None);remember(uid,value);return value
         except ResponseError as error:
-            logging.getLogger('roi-profile').warning('Progression HTTP failure action=%s status=%d attempt=%d',
-                payload.get('action') if payload else 'read', error.code, attempt+1)
+            logging.getLogger('roi-profile').warning('Progression HTTP failure action=%s status=%d attempt=%d source=%s',
+                payload.get('action') if payload else 'read', error.code, attempt+1,error.source)
+            if error.code==503 and attempt+1==len(timeouts) and payload and payload.get('action')=='getStoreItemList':
+                raise TemporaryStoreFailure('Store list temporarily unavailable') from None
             if error.code<500 or attempt+1==len(timeouts):raise Unavailable('Progression service rejected the operation') from None
         except (OSError,ValueError,http.client.HTTPException) as error:
             logging.getLogger('roi-profile').warning('Progression transport failure action=%s type=%s attempt=%d',
@@ -137,7 +141,7 @@ def fields(url,uid):
         request(url,uid,token)
         with LOCK:return deepcopy(CACHE[str(uid)][1]['fields'])
 
-def forward(url,uid,character,name,action,data):
+def forward(url,uid,character,name,action,data,*,native_notice=True):
     token=credential(uid)
     if token is None:return None
     if action not in contract.ACTIONS:raise ValueError('Unsupported progression action')
@@ -147,4 +151,8 @@ def forward(url,uid,character,name,action,data):
         roi_native_lp.authenticate(data)
         data=dict(data,sv_token='0'*64)  # The private loopback credential never leaves this PC.
     payload=dict(action=action,data=data,request_id=uuid.uuid4().hex,character=character,name=name)
-    return request(url,uid,token,payload)['reply']
+    reply=request(url,uid,token,payload)['reply']
+    if native_notice and action=='changeTagName':
+        import roi_team_ticket_notice
+        roi_team_ticket_notice.present(reply)
+    return reply

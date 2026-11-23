@@ -8,8 +8,25 @@ from sessions.observe import SCENES  # noqa: E402
 
 
 def setup(d):
+    from sessions import circle_chat_fulltext, today_first_paint
+    circle_chat_fulltext.setup(d)
+    today_first_paint.setup(d)
     from sessions import version_footer
     version_footer.setup(d)
+    from sessions import ranked_search_status
+    ranked_search_status.setup(d)
+    from sessions import ranked_wait_practice
+    ranked_wait_practice.setup(d)
+    from sessions import ranked_partial_teams
+    ranked_partial_teams.setup(d)
+    from sessions import ranked_team_start_trace
+    ranked_team_start_trace.setup(d)
+    from sessions import team_name_display_trace
+    team_name_display_trace.setup(d)
+    from sessions import team_name_display
+    team_name_display.setup(d)
+    from sessions import result_flow
+    result_flow.setup(d)
     from sessions import lamina_menu, lamina_combat
     import match_lamina
     match_lamina.setup(d)
@@ -39,8 +56,6 @@ def setup(d):
     audio_lifetime.setup(d)
     from sessions import circle_voice
     circle_voice.setup(d)
-    from sessions import result_flow
-    result_flow.setup(d)
     from sessions import replay_trace
     replay_trace.setup(d)
     from sessions import replay_recording
@@ -51,8 +66,19 @@ def setup(d):
     if not lp_payouts.setup(d):
         from sessions import lp_result_trace
         lp_result_trace.setup(d)
+    def scene_created(name):
+        if name in ('Initial','SequencePlay','InitialBattle'):
+            record = getattr(d, 'r46_ranked_result', None)
+            d.r46_ranked_result = None
+            if record and name != 'InitialBattle':
+                from ranked_disconnect import notify_returned
+                notify_returned(*record)
+        d.practice_exit.scene(name)
+        d.log(f"SCENE create {name}")
     for addr, name in SCENES.items():
-        d.bp(addr, lambda h, n=name: d.log(f"SCENE create {n}"))
+        d.bp(addr, lambda h, n=name: scene_created(n))
+    from sessions import summon_sync_trace
+    summon_sync_trace.setup(d)
 
     def res_missing(h):  # 0x140b69dea: rax = resource from 0x1407bb6d0, rbx = requested name
         if h.rax == 0:
@@ -67,3 +93,19 @@ def setup(d):
 
     for fn in ("_invoke_watson", "_invalid_parameter", "_invalid_parameter_noinfo"):
         d.bp_export("msvcr100.dll", fn, watson)
+
+    import ranked_disconnect
+    ranked_disconnect.setup(d, enabled=True)
+
+    import circle_team_ui
+    circle_team_ui.setup(d)
+
+    import peer_profile_warm
+    peer_profile_warm.setup(d)
+
+    # Install after reward/roster observers so their callbacks remain chained.
+    import lamina_result_phase
+    lamina_result_phase.setup(d)
+
+    import ranked_handoff_trace
+    ranked_handoff_trace.setup(d)

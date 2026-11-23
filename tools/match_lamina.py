@@ -14,6 +14,46 @@ WORKER=None
 CACHED=None
 LAST_CHECK=0.
 READING=False
+PRESENTATION_KEY=None
+PRESENTATION_ROWS={}
+PRESENTATION_EPOCH=0
+PRESENTATION_DEPARTED=set()
+LAST_SERVER_ROUND=None
+
+
+def presentation_round(key):
+    """A native round key is public match identity, not an account credential."""
+    global PRESENTATION_KEY,PRESENTATION_ROWS,PRESENTATION_EPOCH,LAST_CHECK
+    if not isinstance(key,str) or len(key)!=32 or not key.strip('0'):
+        key=None
+    with LOCK:
+        if key!=PRESENTATION_KEY:
+            PRESENTATION_KEY,PRESENTATION_ROWS,LAST_CHECK=key,{},0.
+            PRESENTATION_DEPARTED.clear()
+            PRESENTATION_EPOCH+=1
+
+
+def confirmed_departures(key, departed):
+    # The worker has validated this partition against the original Ranked seats.
+    # Keep it past result reporting; the lifecycle worker resets before rendering.
+    with LOCK:
+        if key and key == PRESENTATION_KEY:
+            PRESENTATION_DEPARTED.update(departed)
+
+
+def presentation_choice(uid):
+    with LOCK:
+        return None if uid in PRESENTATION_DEPARTED else PRESENTATION_ROWS.get(uid)
+
+
+def ranked_start(reader,address):
+    from native_lp_input import read
+    header=read(reader,address,26)
+    outer,size,_,_,kind,status=struct.unpack_from('<HHQHHH',header)
+    if kind==0xE623 and status==0 and outer==size+4 and size>=42:
+        payload=read(reader,address+26,20)
+        if 2<=int.from_bytes(payload[18:20],'little')<=4:
+            presentation_round(payload[2:18].hex())
 
 
 def credential():
@@ -72,8 +112,8 @@ def publish():
         print('LAMINA_SYNC selection '+result,flush=True)
 
 
-def fetch():
-    global CACHED,READING
+def fetch(epoch=None):
+    global CACHED,READING,LAST_SERVER_ROUND
     result=None
     try:
         a=credential()
@@ -104,30 +144,41 @@ def fetch():
     finally:
         with LOCK:
             CACHED,READING=result,False
+            # The authenticated server round UUID is distinct from the E608 match
+            # key. Only accept a fetch launched after this client's round began.
+            if (result and epoch==PRESENTATION_EPOCH and PRESENTATION_KEY
+                    and not PRESENTATION_ROWS and result[0]!=LAST_SERVER_ROUND):
+                PRESENTATION_ROWS.update(result[1])
+                LAST_SERVER_ROUND=result[0]
 
 
 def setup(d):
     # Observe the existing P2P roster. Never write speculative peer actors or
     # replay an input from wall-clock HTTP timing.
     previous=[None]
+    trace=(HERE/'lamina-peer-trace.enabled').is_file()
     def poll(debugger):
         global LAST_CHECK,READING
+        with LOCK:
+            if not trace and (not PRESENTATION_KEY or PRESENTATION_ROWS or READING):
+                return
         try:
             def num(p,fmt):
                 size=struct.calcsize(fmt)
                 if not 0x10000<=p<0x7fffffff0000:raise ValueError('bad pointer')
                 return struct.unpack(fmt,debugger.read(p,size))[0]
             play=num(0x141B874D0,'<Q'); reg=num(0x141B87490,'<Q'); roster=num(0x141B87458,'<Q')
-            if num(play+8,'<B') or num(play+0x10,'<I')!=0x150305F0 or num(roster+0x5F650,'<I')==5:
+            if num(play+8,'<B') or num(play+0x10,'<I')!=0x150305F0:
                 previous[0]=None
                 return
             with LOCK:
-                if not READING and time.monotonic()-LAST_CHECK>3:
+                wanted=PRESENTATION_KEY and not PRESENTATION_ROWS
+                if (trace or wanted) and not READING and time.monotonic()-LAST_CHECK>3:
                     READING=True
                     LAST_CHECK=time.monotonic()
-                    threading.Thread(target=fetch,daemon=True).start()
+                    threading.Thread(target=fetch,args=(PRESENTATION_EPOCH,),daemon=True).start()
                 cached=CACHED
-            if not cached:
+            if not trace or not cached:
                 return
             key,expected=cached
             rows=[]
@@ -144,5 +195,4 @@ def setup(d):
                 previous[0]=state
         except (OSError,ValueError,struct.error):
             return
-    if (HERE/'lamina-peer-trace.enabled').is_file():
-        d.poll(poll,every=0.25)
+    d.poll(poll,every=0.25 if trace else 1.)

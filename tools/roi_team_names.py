@@ -10,6 +10,15 @@ import team_names
 TICKET_ID = '1000030020000001'
 
 
+def active_partner(snapshot, actor):
+    value = snapshot.get('tagPartner', '0') if isinstance(snapshot, dict) else '0'
+    try:
+        value = team_names.uid(value)
+        return value if value != team_names.uid(actor) else '0'
+    except ValueError:
+        return '0'
+
+
 def request(url, token, action, data):
     body = json.dumps({'call': action, 'data': data}, separators=(',', ':')).encode('utf-8')
     if len(body) > team_names.MAX_REQUEST_BYTES:
@@ -41,9 +50,10 @@ def finish(path, actor, pending, send):
         raise ValueError('Ambiguous team response; ticket reservation retained')
     native = result.get('data')
     if (not isinstance(native, dict) or native.get('sv_partnerUid') != data['sv_partnerUid']
-            or native.get('sv_freeTagName') != '' or not isinstance(native.get('sv_paidTagName'), str)
+            or not isinstance(native.get('sv_freeTagName'),str) or len(native['sv_freeTagName'].encode('utf-8'))>63
+            or not isinstance(native.get('sv_paidTagName'), str)
             or len(native['sv_paidTagName'].encode('utf-8')) > 63
-            or result['status'] != 'rejected' and native['sv_paidTagName'] != data['sv_tagName']):
+            or result['status'] != 'rejected' and (native['sv_paidTagName'] or native['sv_freeTagName']) != data['sv_tagName']):
         raise ValueError('Invalid team receipt; ticket reservation retained')
     saved = profile_store.read(path)
     # Only an explicit durable rejection/no-op permits a refund. HTTP errors,
@@ -54,7 +64,8 @@ def finish(path, actor, pending, send):
     rows = roi_consumables.owned(dict(saved, **changes))
     changes.update(consumableItems=[r for r in rows if r['sv_itemNum'] != '0'],
                    teamNamePending=None,
-                   teamNameReceipt={'uid': actor, 'request': data, **result})
+                   teamNameReceipt={'uid': actor, 'request': data, **result},
+                   tagPartner=data['sv_partnerUid'])
     profile_store.update(path, changes)
     return result
 
@@ -74,19 +85,30 @@ def change(path, actor, data, send):
         # same-name retries and lets either partner make a later distinct change.
         listing = get(actor, {'sv_uids': [data['sv_partnerUid']]}, send)
         current = listing['sv_tagNames'][0]
-        if current['sv_paidTagName'] == data['sv_tagName']:
+        if (current['sv_paidTagName'] or current['sv_freeTagName']) == data['sv_tagName']:
+            profile_store.update(path, {'tagPartner': data['sv_partnerUid']})
             return {'status': 'unchanged', 'data': {
-                'sv_partnerUid': data['sv_partnerUid'], 'sv_freeTagName': '',
-                'sv_paidTagName': data['sv_tagName']}}
+                'sv_partnerUid': data['sv_partnerUid'], 'sv_freeTagName': current['sv_freeTagName'],
+                'sv_paidTagName': current['sv_paidTagName']}}
         rows = roi_consumables.owned(saved)
         ticket = next((r for r in rows if r['sv_itemId'] == TICKET_ID and int(r['sv_itemNum']) > 0), None)
         if ticket is None:
-            raise ValueError('A Team Name Ticket is required')
+            return {'status':'ticket-required','data':{
+                'sv_partnerUid':data['sv_partnerUid'],
+                'sv_freeTagName':current['sv_freeTagName'],
+                'sv_paidTagName':current['sv_paidTagName'],
+                'sv_teamNameStatus':'ticket-required',
+                'sv_teamNameMessage':'You need a Team Name Ticket to change this team name. Buy Team Name Tickets from the Store first.'}}
         ticket['sv_itemNum'] = str(int(ticket['sv_itemNum']) - 1)
         pending = {'uid': actor, 'operation': uuid.uuid4().hex, 'request': data}
         profile_store.update(path, {'consumableItems': rows, 'teamNamePending': pending,
                                    'consumableHoldSequence': roi_consumables.hold_sequence(saved, rows)})
         return finish(path, actor, pending, send)
+
+
+def change_circle(path,actor,data,send):
+    team_names.circle_rename(actor,data)
+    return change(path,actor,data,send)
 
 
 def recover(path, actor, send):

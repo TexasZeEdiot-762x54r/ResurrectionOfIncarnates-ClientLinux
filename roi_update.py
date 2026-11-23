@@ -17,11 +17,15 @@ import urllib.request
 
 URL = 'https://riseofincarnates.artificerreviver.com/updates/v1/'
 KEY = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBoZJQqy/R+3QhWQKi4YNT45ykECfr4C3dneehDyD1TE'
-STREAMS = {'dev/windows', 'dev/linux', 'dev/workbench-windows', 'stable/windows', 'stable/linux'}
+STREAMS = {'stable/windows', 'stable/linux'}
 MAX = 16 * 1024 * 1024
 BASE = 'roi-update-base.json'
 STATE = '.roi-update'
 
+
+
+def release_label(revision):
+    return '2.06 - R'+str(revision-3)+'P' if revision>=4 else '2.06 - R'+str(revision)
 
 def require(ok, msg):
     if not ok:
@@ -61,6 +65,7 @@ def path(root, n):
 
 def managed(n):
     return (n == 'RELEASE-FILES.json' or n in ('README.md','FRIEND-TEST.md','setup_client.py',
+            'Play.sh','roi_update.py','roi_update_assets.py',
             'tools/play.ps1','tools/RELEASE-CLIENT','tools/award-policy.json','tools/circle-voice-asset.json',
             'tools/customize-labels.json','tools/customize-parts.json','tools/customize-thumb-plan.json',
             'tools/grid-reward-policy.json','tools/lamina_abilities.json','tools/recovered-skillcube-master.json',
@@ -197,12 +202,22 @@ def update(root,mode,fetch=get,confirm=ask,verifier=verify,platform=None):
     with lock(path(work,'lock')):
         recover(root,work)
         installed=path(work,'installed.json')
-        old=validate(verifier(installed.read_bytes() if installed.exists()
-                              else json.dumps(base['release']).encode()),stream)
+        baseline=validate(verifier(json.dumps(base['release']).encode()),stream)
+        old=baseline
+        if installed.exists():
+            prior=verifier(installed.read_bytes())
+            if prior.get('stream')==stream:
+                old=validate(prior,stream)
+            else:
+                # Explicit checkout migration only: same platform, legacy dev to official.
+                require(stream=='stable/'+platform and prior.get('stream')=='dev/'+platform
+                        and validate(prior,prior['stream'])['revision']<=baseline['revision'],
+                        'Installed receipt belongs to another release channel')
         cfg=json.loads((root/'tools/config.json').read_text(encoding='utf-8-sig'))
         # Unknown/offline installs never silently contact the Internet.
-        if not ((cfg.get('release_mode')=='internet' and cfg.get('public_lobby_host')=='riseofincarnates.artificerreviver.com')
-                or (stream=='dev/workbench-windows' and cfg.get('lobby_transport')=='experimental-local')):
+        enabled=(stream=='dev/workbench-windows' and cfg.get('lobby_transport')=='experimental-local'
+                 or cfg.get('release_mode')=='internet' and cfg.get('public_lobby_host')=='riseofincarnates.artificerreviver.com')
+        if not enabled:
             print('Public updates disabled for this installation.')
             return
         try:
@@ -212,7 +227,7 @@ def update(root,mode,fetch=get,confirm=ask,verifier=verify,platform=None):
             require(new['revision']>=old['revision'],'Older release rejected')
             if new['revision']==old['revision']:
                 require(old['files']==new['files'],'Conflicting content at installed revision')
-                print('Up to date: 2.06 - R'+str(old['revision']))
+                print('Up to date: '+release_label(old['revision']))
                 return
             changed={}
             for n,row in new['files'].items():
@@ -229,7 +244,7 @@ def update(root,mode,fetch=get,confirm=ask,verifier=verify,platform=None):
                     require(filehash(p)==old['files'][n][0],'Locally modified obsolete file: '+n)
                     removed.append(n)
             total=sum(v[1] for v in changed.values())
-            text=f"2.06 - R{new['revision']} is available (installed R{old['revision']}).\nDownload: {total:,} bytes.\n\n{new['notes']}\n\nUpdate before playing?"
+            text=f"{release_label(new['revision'])} is available (installed {release_label(old['revision'])}).\nDownload: {total:,} bytes.\n\n{new['notes']}\n\nUpdate before playing?"
             if mode=='check' or (mode!='apply' and not confirm(text)):
                 print(text)
                 return
@@ -273,7 +288,7 @@ def update(root,mode,fetch=get,confirm=ask,verifier=verify,platform=None):
                     dest.parent.mkdir(parents=True,exist_ok=True)
                     os.replace(source,dest)
             (work/'journal.json').unlink()
-            print('Installed 2.06 - R'+str(new['revision']))
+            print('Installed '+release_label(new['revision']))
         finally:
             recover(root,work)
 

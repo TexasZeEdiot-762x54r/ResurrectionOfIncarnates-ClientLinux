@@ -1,4 +1,4 @@
-"""Treat an incomplete optional ambience bank as unavailable to native callers."""
+"""Treat incomplete music/ambience banks as unavailable to guarded native callers."""
 import struct
 
 ADDRESS = 0x140BA23D0
@@ -21,7 +21,7 @@ def incomplete_ambience(d, manager, query):
     if not prefix_ptr:
         return None
     prefix = d.cstr(prefix_ptr, 80)
-    if not prefix or query.lower() != (prefix + 'SE_STAGE_AMB').lower():
+    if not prefix or query.lower() not in {(prefix + name).lower() for name in ('SE_STAGE_AMB','BGM')}:
         return None
     for index in range(32):
         entry = read_q(d, manager + 0x1e8 + index * 8)
@@ -67,6 +67,6 @@ def setup(d):
             if debugger.read(ret - 5, 5) != call or branch not in (b'\x85\xc0\x78', b'\x85\xc0\x79'):
                 raise RuntimeError('Sound-bank caller lacks verified missing-bank branch')
         debugger.bp(ADDRESS, guard)
-        debugger.log('STAGE_AMBIENCE incomplete-bank guard v3 armed')
+        debugger.log('STAGE_AMBIENCE incomplete music/ambience bank guard v4 armed')
 
     d.on_start(arm)

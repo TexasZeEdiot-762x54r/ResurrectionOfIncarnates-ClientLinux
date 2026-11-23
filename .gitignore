@@ -17,3 +17,11 @@ __pycache__/
 /tools/circle-voice-policy.json
 /tools/*replay*.bin
 /tools/replays/
+
+/.roi-update/
+/backups/
+/tools/lamina_ability_*.json
+/tools/compatibility-backups/
+/tools/*.local.txt
+/tools/*.log
+/tools/**/*.dmp

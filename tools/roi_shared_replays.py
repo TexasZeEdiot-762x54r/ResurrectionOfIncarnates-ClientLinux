@@ -51,7 +51,7 @@ def validate_row(row, payload=False):
     replay.integer(row['sv_saveTime'],0,2**53-1)
     if type(row['sv_entries']) is not list or len(row['sv_entries'])!=4:
         raise ValueError('Invalid shared recording roster')
-    owner=row['sv_entries'][0].get('sv_uid') if type(row['sv_entries'][0]) is dict else None
+    owner=next((p.get('sv_uid') for p in row['sv_entries'] if isinstance(p,dict) and p.get('sv_uid') not in (None,'0')),None)
     value={k:v for k,v in row.items() if k not in ('sv_replayId','sv_saveTime')}
     if payload:replay.normalize(value,owner)
     else:replay.normalize_metadata(value,owner)

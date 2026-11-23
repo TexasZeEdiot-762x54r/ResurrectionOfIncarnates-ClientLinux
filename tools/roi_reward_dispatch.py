@@ -15,8 +15,9 @@ def successful(reply):
 
 
 class Job:
-    def __init__(self, data):
+    def __init__(self, data, mode):
         self.data = deepcopy(data)
+        self.mode = mode
         self.ready = threading.Event()
         self.lock = threading.Lock()
         self.staged = False
@@ -56,7 +57,8 @@ class Dispatcher:
                 from roi_native_lp import hex_id
                 launch = hex_id(data.get('launch'))
                 battle = data.get('battle_id')
-                if (len(body) > 16384 or data.get('action') != 'stage_bot'
+                action = data.get('action')
+                if (len(body) > 16384 or action not in ('stage_bot', 'settle_custom')
                         or type(battle) is not str or not battle.isascii()
                         or not battle.isdigit() or not 0 < int(battle) < 2**63):
                     return failed()
@@ -77,14 +79,20 @@ class Dispatcher:
                             del self.jobs[old]
                     if len(self.jobs) >= 8 or any(k[1] == battle for k in self.jobs):
                         return failed()
-                    job = Job(data)
+                    job = Job(data, 'bot' if action == 'stage_bot' else 'custom')
                     self.jobs[key] = job
 
                     def stage():
                         try:
                             opening = {k: data[k] for k in ('sv_token', 'launch')}
                             opening['action'] = 'open'
-                            job.staged = successful(call(opening)) and successful(call(job.data))
+                            if not successful(call(opening)):
+                                return
+                            reply = call(job.data)
+                            job.staged = successful(reply)
+                            if job.mode == 'custom' and job.staged:
+                                with self.lock:
+                                    job.receipt = deepcopy(reply)
                         except Exception:
                             job.staged = False
                         finally:
@@ -105,9 +113,11 @@ class Dispatcher:
             with self.lock:
                 job = self.jobs.get(key)
                 cached = deepcopy(job.receipt) if job is not None else None
-            if job is not None and data.get('mode') == 'bot':
-                # No slow fallback inside the HUD hook. A successful endBotBattle
-                # reply is released only after its committed receipt is cached.
+            if job is not None:
+                if data.get('mode') != job.mode:
+                    return failed()
+                # No slow fallback inside the HUD hook. Bot receipts are cached
+                # after endBotBattle; Custom receipts are the worker's settlement reply.
                 return cached if cached is not None else failed()
             return normal()
 
@@ -117,7 +127,8 @@ class Dispatcher:
         if type(battle) not in (str, int):
             return normal()
         with self.lock:
-            candidates = [job for key, job in self.jobs.items() if key[1] == str(battle)]
+            candidates = [job for key, job in self.jobs.items()
+                          if key[1] == str(battle) and job.mode == 'bot']
         if not candidates:
             return normal()  # Older clients retain their existing behavior.
         job = candidates[0]

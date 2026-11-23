@@ -111,6 +111,13 @@ def policy():
                 if not isinstance(grades, dict) or set(grades) != {'S', 'A', 'B', 'C'}:
                     raise ValueError('Incomplete Team Bonus grades')
                 team_bonuses[outcome] = {grade: integer(amount) for grade, amount in grades.items()}
+    draws = value.get('draw_rewards')
+    if draws is not None and (not isinstance(draws, dict)
+            or set(draws) != {'enabled', 'basis', 'provenance', 'source'}
+            or type(draws['enabled']) is not bool or draws['basis'] != 'loss'
+            or draws['provenance'] != 'user_selected_revival'
+            or not isinstance(draws['source'], str) or not 1 <= len(draws['source'].strip()) <= 2048):
+        raise ValueError('Invalid completed-draw reward policy')
     match_xp = roi_match_xp.policy(value.get('match_xp'))
     import roi_cube_drops
     cube_drops = roi_cube_drops.policy(value.get('cube_drops'))
@@ -120,6 +127,7 @@ def policy():
                 lp_enabled=lp_enabled, battle_bonuses=battle_bonuses,
                 lp_components=components, team_bonuses=team_bonuses,
                 match_xp=match_xp, cube_drops=cube_drops,
+                draw_rewards=draws is not None and draws['enabled'],
                 digest=hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest())
 
 
@@ -226,8 +234,10 @@ def lp_components(current, result, summary):
     Native adapters must establish the displayed score/grade before calling this.
     These rates are owner-selected revival rules, not an original economy claim.
     """
+    if result == 0 and current.get('draw_rewards') is True:
+        result = -1  # Approved completed draws use the existing loss LP table.
     if result not in (-1, 1):
-        return []  # No draw/abandonment payout has been selected.
+        return []  # Unknown/abandoned outcomes are not completed draws.
     battle = current['battle_bonuses'][str(result)]
     if current['lp_components'] == 'battle_only':
         return [('6', battle)]

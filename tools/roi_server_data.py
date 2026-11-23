@@ -8,6 +8,7 @@ Protocol (from roi.exe):
   The client reads most numbers with strtoui64 on *string* values, so values are sent as strings.
 """
 import json
+import threading
 import time
 from copy import deepcopy
 
@@ -16,6 +17,8 @@ from server_state import STATE  # persists across reloads of this module
 TOKEN = "local-token"
 SECRET = "local-secret"
 CALLS = {}
+CIRCLE_REFRESH_LOCK = threading.Lock()
+CIRCLE_REFRESH_DEADLINE = 0.0
 
 
 def call(name):
@@ -75,10 +78,6 @@ def relay_credential():
     account=roi_progression_client.credential(pid())
     if account is not None:
         return account
-    import roi_progression_client
-    account=roi_progression_client.credential(pid())
-    if account is not None:
-        return account
     # Never leak an old WireGuard invitation to the anonymous public service.
     return '' if paths._cfg.get('lobby_transport') == 'tls-public' else paths._cfg.get('lobby_token', '')
 
@@ -119,13 +118,20 @@ PERMANENT = "9999999999999"   # sv_charaEnableTerm >= 0x9184e729fff means owned 
 SAVE_FILE = __import__("pathlib").Path(__file__).resolve().parent / "player_profile.json"
 
 
-def saved():
+def saved(*, refresh_lamina=False):
     """What the player changed in game (kept across server restarts): active character, tutorial flags."""
     import profile_store
     local=profile_store.read(SAVE_FILE)
     import roi_progression_client
     import progression_contract
     remote=roi_progression_client.fields(relay_url(f'/progress/{pid()}'),pid())
+    if refresh_lamina and isinstance(remote, dict) and 'playerLevel' in remote:
+        import release_lamina
+        try:
+            release_lamina.publish(remote)
+        except OSError:
+            # The menu mirror can retry on the next own-profile read.
+            pass
     return local if remote is None else progression_contract.merge(local,remote)
 
 
@@ -135,25 +141,37 @@ def save(**changes):
 
 
 def own_circle_id():
-    # This independent Lamina sandbox has no public Circle membership.
-    return '0'
+    current = saved().get('circleMembership', {})
+    return current.get('id', '0') if current.get('uid') == pid() else '0'
 
 
 def circle_action(action, data):
-    if action == 'getCircleInfo':
-        import circles
-        return ok({'sv_circle': circles.snapshot(None, None),
-                   'sv_leaderName': '', 'sv_invitings': []})
     import roi_circles
     import roi_circle_voice
+    import profile_store
+    previous = profile_store.read(SAVE_FILE).get('circleMembership')
     try:
+        if action == 'getCircleName':
+            import circle_name_reads
+            actor, token = pid(), relay_credential()
+            return ok(circle_name_reads.CACHE.lookup(actor, token, data,
+                lambda: roi_circles.request(relay_url(f'/circle/{actor}'), token, actor,
+                    STATE.get('name', 'LocalPlayer'), action, circle_name_reads.request_data(data))))
         result = roi_circles.request(relay_url(f'/circle/{pid()}'), relay_credential(), pid(),
                                     STATE.get('name', 'LocalPlayer'), action, data)
-        save(circleMembership={'uid': pid(), 'id': result['circle_id']})
+        membership = {'uid': pid(), 'id': result['circle_id']}
+        save(circleMembership=membership)
         if action in ('getCircleInfo', 'setupCircle'):
             roi_circle_voice.observe_circle(pid(), result['data'].get('sv_circle'))
-        elif action in ('leaveCircle', 'breakUpCircle'):
+        elif action in ('leaveCircle', 'breakUpCircle', 'joinCircle'):
             roi_circle_voice.record(pid())
+        if (action in ('setupCircle', 'leaveCircle', 'breakUpCircle', 'joinCircle')
+                or action == 'getCircleInfo' and membership != previous):
+            # Remote peers derive the cosmetic voice rule from this shared
+            # profile. Republish when membership changes, not on every native
+            # self-profile refresh; repeated publication can exhaust the local
+            # TLS admission budget during rapid selector transitions.
+            publish_profile()
         return ok(result['data'])
     except Exception as exc:
         if action == 'getCircleInfo':
@@ -166,8 +184,18 @@ def circle_action(action, data):
 
 
 def refresh_circle():
-    if STATE.get('circle_service'):
-        circle_action('getCircleInfo', {})
+    global CIRCLE_REFRESH_DEADLINE
+    if not STATE.get('circle_service') or time.monotonic() < CIRCLE_REFRESH_DEADLINE:
+        return
+    with CIRCLE_REFRESH_LOCK:
+        if time.monotonic() < CIRCLE_REFRESH_DEADLINE:
+            return
+        try:
+            circle_action('getCircleInfo', {})
+        finally:
+            # One refresh is enough for all profile loads started by the same
+            # menu transition, including concurrent native preload requests.
+            CIRCLE_REFRESH_DEADLINE = time.monotonic() + 2.0
 
 
 @call('setupCircle')
@@ -183,6 +211,16 @@ def get_circle_info(data):
 @call('getCircleMemberList')
 def get_circle_members(data):
     return circle_action('getCircleMemberList', data)
+
+
+@call('joinCircle')
+def join_circle(data):
+    return circle_action('joinCircle', data)
+
+
+@call('changeSubLeader')
+def change_subleaders(data):
+    return circle_action('changeSubLeader',data)
 
 
 @call('getTagName')
@@ -204,11 +242,38 @@ def team_request(action, data):
     return roi_team_names.request(relay_url(f'/team/{pid()}'), relay_credential(), action, data)
 
 
+@call('circleTeamNameUI')
+def circle_team_name_ui(data):
+    import profile_store
+    import roi_progression_client
+    if not isinstance(data, dict) or data.get('actor') != pid():
+        return {'result': 'NG', 'data': {}}
+    payload = {k: data.get(k) for k in ('sv_partnerUid', 'sv_tagName', 'sv_isCircle')}
+    try:
+        selected = profile_store.read(SAVE_FILE).get('activeChara', 1)
+        reply = roi_progression_client.forward(relay_url(f'/progress/{pid()}'), pid(), selected,
+            STATE.get('name', 'LocalPlayer'), 'changeTagName', payload, native_notice=False)
+        if reply is None:
+            return change_tag_name(payload)
+        def publish_committed():
+            try:
+                publish_profile()
+            except (OSError, ValueError):
+                pass
+        threading.Thread(target=publish_committed, daemon=True).start()
+        return reply
+    except (roi_progression_client.Unavailable, OSError, ValueError, PermissionError):
+        return {'result': 'NG', 'data': {}}
+
+
 @call('changeTagName')
 def change_tag_name(data):
     import roi_team_names
     try:
-        result = roi_team_names.change(SAVE_FILE, pid(), data, team_request)
+        if isinstance(data,dict) and data.get('sv_isCircle') in (1,'1'):
+            result = roi_team_names.change_circle(SAVE_FILE,pid(),data,team_request)
+        else:
+            result = roi_team_names.change(SAVE_FILE, pid(), data, team_request)
         if result['status'] == 'rejected':
             return {'result': 'NG', 'time': str(int(time.time())), 'data': {}}
     except (OSError, ValueError, TypeError) as exc:
@@ -217,7 +282,8 @@ def change_tag_name(data):
         return {'result': 'NG', 'time': str(int(time.time())), 'data': {}}
     publish_profile()
     # Native types 54/55 parse these fields at 0x140091b60. Type 55 then reloads inventory.
-    return ok(result['data'])
+    native = dict(result['data'], sv_teamNameStatus=result['status'])
+    return ok(native)
 
 
 @call('getPlayerState')
@@ -234,6 +300,12 @@ def find_circle(data):
 @call('getCircleName')
 def get_circle_name(data):
     return circle_action('getCircleName', data)
+
+
+@call('kickCircleMember')
+
+def kick_circle_member(data):
+    return circle_action('kickCircleMember', data)
 
 
 @call('leaveCircle')
@@ -400,8 +472,19 @@ def tutorial_map():
 ALL_TUTORIALS = "2147483647"  # sv_userTutorial is a bitmask (0x1f = main tutorial; higher bits = hint popups)
 
 
+def lamina_profile_fields(skill_profile, lamina_profile):
+    import release_policy
+    import roi_lamina
+    state = roi_lamina.state(lamina_profile)
+    if not release_policy.lamina_allowed(skill_profile):
+        return '0', []
+    rows = [dict(row, sv_customSlot=[]) for row in roi_lamina.profile_rows(lamina_profile)]
+    return str(state['selected_id']), rows
+
+
 def profile():
     import importlib
+    import roi_team_names
     import roi_custom
     import roi_data
     import roi_skills
@@ -415,13 +498,13 @@ def profile():
     import profile_store
     with profile_store.LOCK:
         importlib.reload(roi_skills)
-        skill_profile = saved()
+        skill_profile = saved(refresh_lamina=True)
         skill_grids = roi_skills.grids(skill_profile)
         skill_inventory = roi_skills.inventory(skill_profile)
     good_counts = commendation_sync.counts(skill_profile, pid())
     chars = []
     for cid in sorted(roi_data.CHARACTERS):
-        items = roi_custom.owned(cid) if skill_profile.get('skillGridRuleset') == 'unlocked' else []
+        items = roi_custom.owned(cid)
         slots = custom_slots(cid, skill_profile, items)
         active = int(hold_id(skill_profile.get("activeCustomSlot", {}).get(str(cid), 0)))
         chars.append({
@@ -431,12 +514,8 @@ def profile():
             "sv_customItems": items, "sv_customSlots": slots,
             "sv_activeCustomSlotNum": str(active if active < len(slots) else 0),
         })
-    import roi_lamina
     lamina_profile = profile_store.read(SAVE_FILE.parent / 'lamina_profile.json')
-    lamina_state = roi_lamina.state(lamina_profile)
-    import release_lamina
-    lamina_access = release_lamina.publish(skill_profile)
-    laminas = [dict(row, sv_customSlot=[]) for row in roi_lamina.profile_rows(lamina_profile)] if lamina_access else []
+    active_lamina, laminas = lamina_profile_fields(skill_profile, lamina_profile)
     return {
         "_id": pid(), "sv_uid": pid(), "sv_onlineId": pid(),
         "sv_userName": STATE.get("name", "Player"), "sv_userRegion": STATE.get("region", "SE"),
@@ -450,9 +529,11 @@ def profile():
         "sv_skillgrids": skill_grids, "sv_skillcubeHoldLimit": str(max(100, len(skill_inventory))),
         "sv_skillcubes": skill_inventory, "sv_items": roi_consumables.owned(skill_profile),
         "sv_onBoostList": roi_boosts.native_rows(skill_profile),
-        "sv_disconnNum": "0", "sv_circleId": own_circle_id(), "sv_activeCharaId": str(active_chara()), "sv_activeSupLamId": str(lamina_state['selected_id'] if lamina_access else 0),
+        "sv_disconnNum": "0", "sv_circleId": own_circle_id(), "sv_activeCharaId": str(active_chara()),
+        "sv_activeSupLamId": active_lamina,
         "sv_characters": chars, "sv_supLams": laminas,
-        "sv_enteredRoomId": "0", "sv_tagPartner": "0", "sv_recipes": [], "sv_compositeStackLimit": "1",
+        "sv_enteredRoomId": "0", "sv_tagPartner": roi_team_names.active_partner(skill_profile, pid()),
+        "sv_recipes": [], "sv_compositeStackLimit": "1",
         "sv_compositeStacks": [], "sv_battleRecords": roi_records.profile_records(skill_profile, pid(), sum(good_counts.values())),
         "sv_disconnectLog": "0", "sv_disconnCriminal": "0",
     }
@@ -745,6 +826,18 @@ def get_item_mail(data):
     return ok({"sv_mails": [], "sv_messages": [], "sv_itemMails": []})
 
 
+@call('warmPeerProfiles')
+def warm_peer_profiles(data):
+    import peer_profile_warm
+    if 'player_id' not in STATE:
+        return {'result': 'NG', 'data': {}}
+    try:
+        accepted = peer_profile_warm.WARMER.submit(data, pid(), fetch_profile, pid)
+    except (ValueError, TypeError):
+        return {'result': 'NG', 'data': {}}
+    return ok({'queued': accepted})
+
+
 @call("loadPlayer")
 def load_player(data):
     q = data.get("query") or {}
@@ -771,13 +864,14 @@ def load_player(data):
         # Unknown remote appearance must never borrow our equipped cosmetics.
         # Retain the compatible legacy placeholder shape, but use explicit base
         # outfits and no accessories. Do not persist this as the remote profile.
-        guest = explicit_profile_outfits(profile(), defaults_only=True)
-        guest['sv_onBoostList'] = []
-        import guest_profiles
-        guest = guest_profiles.compact(guest)
+        import neutral_peer
         import player_names
-        guest.update({"_id": who, "sv_uid": who, "sv_onlineId": who, "sv_userName": player_names.get(who), "sv_activeCharaId": "1", "sv_circleId": "0"})
-        return ok(guest)
+        display_name = player_names.get(who)
+        if display_name == 'Player ' + who[-4:]:
+            import profile_reads
+            verified = profile_reads.CACHE.verified_name(relay_url(f'/profile/{who}'), relay_credential(), who)
+            display_name = verified or display_name
+        return ok(neutral_peer.build(who, display_name, PERMANENT, ALL_TUTORIALS))
     return ok({})
 
 
@@ -854,6 +948,22 @@ def circle_ranking(data):
 
 @call('getTagRanking')
 def tag_ranking(data):
+    if data.get('sv_filter') == 1:
+        import roi_rankings, nrt_rooms
+        roi_rankings.empty_reply('getTagRanking',data)
+        if not roi_rankings.supported('getTagRanking',dict(data,sv_filter=0)):
+            return ok(roi_rankings.empty_reply('getTagRanking',data))
+        friends=nrt_rooms.steam().ranking_friends()
+        rows=[]
+        if friends:
+            for start in range(1,10001,100):
+                page=roi_rankings.request(relay_url(f'/rankings/{pid()}'),relay_credential(),
+                    'getTagRanking',dict(data,sv_filter=0,sv_start=start,sv_range=100))
+                rows.extend(r for r in page['ranking'] if any(
+                    str(player['sv_onlineId']) in friends for player in r['sv_tagPlayers']))
+                if start+99 >= int(page['sv_total']) or not page['ranking']:break
+        start=data['sv_start']-1
+        return ok(dict(sv_total=str(len(rows)),ranking=rows[start:start+data['sv_range']]))
     return ranking_response('getTagRanking', data)
 
 
@@ -941,11 +1051,15 @@ def respond(method, path, headers, body):
     except ValueError:
         return 400, {}, {}
     if path.endswith("/Dragon/authorize"):
+        import result_store_window
+        result_store_window.observe(pid(),'authorize',{})
         return 200, {"oauth_token": TOKEN, "oauth_token_secret": SECRET}, authorize(req)
     if path.endswith("/Dragon/game"):
+        import result_store_window
         name = req.get("call")
         if type(name) is not str:
             return 400, {}, {}
+        optional_list = result_store_window.observe(pid(), name, req.get("data"))
         fn = CALLS.get(name)
         if fn:
             import progression_contract
@@ -955,6 +1069,12 @@ def respond(method, path, headers, body):
                     selected=profile_store.read(SAVE_FILE).get('activeChara',1)
                     reply=roi_progression_client.forward(relay_url(f'/progress/{pid()}'),pid(),selected,
                         STATE.get('name','LocalPlayer'),name,req.get('data') or {})
+                except roi_progression_client.TemporaryStoreFailure:
+                    if optional_list:
+                        import logging
+                        logging.getLogger('roi-profile').warning('Deferred optional post-battle Store list type=%d', req['data']['sv_type'])
+                        return 200, {}, ok(dict(sv_cartItems=[],sv_storeItems=[],sv_items=[]))
+                    return 200, {}, {'result':'NG','time':str(int(time.time())),'data':{}}
                 except (roi_progression_client.Unavailable,ValueError,PermissionError):
                     return 200, {}, {'result':'NG','time':str(int(time.time())),'data':{}}
                 if reply is not None:
@@ -972,7 +1092,11 @@ def respond(method, path, headers, body):
                         'getCharaUsageRanking', 'getCharaRanking', 'getCircleRanking',
                         'getTagRanking', 'getGoodRanking'} and not isinstance(req.get('data'), dict):
                 return 200, {}, {'result': 'NG', 'time': str(int(time.time())), 'data': {}}
-            return 200, {}, fn(req.get("data") or {})
+            reply=fn(req.get("data") or {})
+            if name=='changeTagName':
+                import roi_team_ticket_notice
+                roi_team_ticket_notice.present(reply)
+            return 200, {}, reply
         import circles
         if req.get('call') in circles.UNSUPPORTED | getattr(circles,'NATIVE_GATED',set()):
             return 200, {}, {'result': 'NG', 'time': str(int(time.time())), 'data': {}}

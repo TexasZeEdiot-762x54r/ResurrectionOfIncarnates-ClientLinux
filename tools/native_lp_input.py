@@ -38,6 +38,22 @@ def is_replay(reader):
     return value == 1
 
 
+def local_character(reader):
+    """Return the retained local battle character after the result HUD begins building."""
+    if is_replay(reader):
+        raise ValueError('Replay is not a completed player appearance')
+    manager = pointer(reader, 0x141B874D0)
+    if number(reader, manager + 0x10, '<I') != 0x150305F0:
+        raise ValueError('Unknown native battle header')
+    own = number(reader, manager + 0x14, '<B')
+    if own > 3:
+        raise ValueError('Invalid native player slot')
+    character = number(reader, manager + 0x30 + own * 0x22D8 + 10, '<B')
+    if not 1 <= character <= 21:
+        raise ValueError('Invalid native player character')
+    return character
+
+
 def teammate(reader):
     if is_replay(reader):
         raise ValueError('Replay is not a completed player appearance')

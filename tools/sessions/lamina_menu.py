@@ -30,6 +30,7 @@ LEFT_EDGES = (0x1407D4AD0, 0x1407D4AD5)
 MOUSE_POSITION, WINDOW_MANAGER = 0x1407D4B47, 0x141B874A8
 PANEL_FRAME, ROW_TEXT, ACTIVE_TICK = 0x14037CC58, 0x14037CCA6, 0x14037E010
 CLOSING, CLEANUP = 0x14037DDC0, 0x14037DD80
+PROFILE_RETURN = 0x1403CA1D0
 BLOCK_HASHES = {
     0x1407D48C0: (734, '184da8701c127c89f2c7d896d936762bd2c7c426515e4463897a05c2aed247d3'),
     0x14037CC20: (172, '78e03830f82ab6470445308d9c1e5bc5ff7bb542f7866c881ce0e3dd0acf2860'),
@@ -111,6 +112,23 @@ def refresh_thunk(slot):
     for pos in (owner_jump, button_jump):
         code[pos] = len(code) - pos - 1
     return bytes(code) + GUARDS[REFRESH]
+
+
+def profile_close_thunk(state):
+    """Detach the Profile return route, then close its parent after Open returns."""
+    code = bytearray(bytes.fromhex('48 83 ec 30 48 89 44 24 20'))
+    code.extend(b'\x49\xbb' + struct.pack('<Q', state))
+    code.extend(bytes.fromhex('4d 8b 13 4d 85 d2 74 25'))
+    code.extend(bytes.fromhex('41 c6 82 a6 03 00 00 00'))
+    code.extend(bytes.fromhex('49 c7 82 b8 03 00 00 00 00 00 00'))
+    code.extend(bytes.fromhex('49 c7 82 c0 03 00 00 00 00 00 00'))
+    code.extend(bytes.fromhex('49 c7 03 00 00 00 00'))
+    code.extend(bytes.fromhex('49 8b 4b 08 48 85 c9 74 11'))
+    code.extend(bytes.fromhex('49 c7 43 08 00 00 00 00 48 8b 01 ff 90 98 00 00 00'))
+    code.extend(bytes.fromhex('48 8b 44 24 20 48 83 c4 30'))
+    code.extend(b'\x49\xbb' + struct.pack('<Q', state))
+    code.extend(bytes.fromhex('4d 8b 53 10 49 c7 43 10 00 00 00 00 41 ff e2'))
+    return bytes(code)
 
 
 def action_row(x, y, width, height):
@@ -209,6 +227,7 @@ class Session:
         self.pending = None
         self.last_selection = None
         self.selector = self.view = self.mouse = self.choice = self.committing = None
+        self.profile_parent = None
         self.temporary = {}
         self.click_notes = 0
 
@@ -262,6 +281,7 @@ class Session:
         for addr in tuple(self.temporary):
             self.unhook(addr)
         self.selector = self.view = self.mouse = self.choice = self.committing = None
+        self.profile_parent = None
 
     def open_rows(self, hit):
         self.clear_rows()
@@ -271,11 +291,45 @@ class Session:
         if (_q(self.d, hit.rcx) == SELECTOR_VTABLE
                 and _read(self.d, hit.rcx + 0x3A4, 1) == b'\0'):
             self.selector, self.view = hit.rcx, value
+            self.dismiss_profile_after_open(hit)
             for addr in LEFT_EDGES:
                 self.hook_once_or_scoped(addr, self.press)
 
+    def dismiss_profile_after_open(self, hit):
+        selector = hit.rcx
+        if _q(self.d, selector + 0x3C0) != PROFILE_RETURN:
+            return False
+        owner = _q(self.d, selector + 0x3B8)
+        parent = _q(self.d, owner + 0x3B8) if _pointer(owner) else 0
+        vtable = _q(self.d, parent) if _pointer(parent) else 0
+        close = _q(self.d, vtable + 0x98) if _pointer(vtable) else 0
+        if not all(map(_pointer, (owner, parent, vtable, close))):
+            raise ValueError('Invalid Profile return route')
+        self.profile_parent = (selector, parent)
+        self.d.log('LAMINA_MENU Profile parent retained until selector closes')
+        return True
+
+    def dismiss_profile_after_close(self, hit):
+        if not self.profile_parent or self.profile_parent[0] != hit.rcx:
+            return False
+        selector, parent = self.profile_parent
+        resume = _q(self.d, hit.rsp) if _pointer(hit.rsp) else 0
+        if not _pointer(resume):
+            raise ValueError('Invalid selector close continuation')
+        if any(_q(self.d, self.profile_close_state + offset) for offset in (0, 8, 16)):
+            raise RuntimeError('Profile close continuation already pending')
+        _writes(self.d, [(self.profile_close_state,
+                          struct.pack('<QQQ', selector, parent, resume)),
+                         (selector + 0x3A6, b'\0'),
+                         (selector + 0x3B8, bytes(16)),
+                         (hit.rsp, struct.pack('<Q', self.profile_close_entry))])
+        self.profile_parent = None
+        self.d.log('LAMINA_MENU Profile parent scheduled to close after selector cleanup')
+        return True
+
     def close_rows(self, hit):
         if hit.rcx == self.selector:
+            self.dismiss_profile_after_close(hit)
             self.clear_rows()
 
     def preview(self):
@@ -484,11 +538,14 @@ class Session:
         self.label_address = self.slot + 16
         entry = self.slot + 48
         self.row_thunk, self.row_buffers = self.slot + 160, self.slot + 256
+        self.profile_close_entry, self.profile_close_state = self.slot + 1840, self.slot + 2008
         # ACTIVE_TICK is on the selector's own thread with call shadow space.
         confirm_jump = (b'\x48\xb8' + struct.pack('<Q', CONFIRM) + b'\xff\xd0\x48\xb8'
                         + struct.pack('<Q', ACTIVE_TICK) + b'\xff\xe0')
         _writes(self.d, [(self.slot, bytes(16)), (self.label_address, LABEL),
                          (self.row_thunk, confirm_jump),
+                         (self.profile_close_entry, profile_close_thunk(self.profile_close_state)),
+                         (self.profile_close_state, bytes(24)),
                          (entry, refresh_thunk(self.slot))])
         changed = []
         armed = []

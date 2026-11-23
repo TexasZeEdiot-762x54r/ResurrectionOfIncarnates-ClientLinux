@@ -36,10 +36,6 @@ def snapshot(saved, value):
     import roi_skills
     value = normalize(value)
     holds = value['holds']
-    import release_policy
-    if saved.get('skillGridRuleset') and not release_policy.grid_allowed(saved):
-        if holds:raise ValueError('Skill system is locked')
-        return value
     if not roi_skills.enabled(saved) and not holds:
         return value
     grids = roi_skills.grids(saved)
@@ -54,9 +50,6 @@ def apply(saved, usage, result):
         return {}, None
     import roi_skills
     usage = snapshot(saved, usage)
-    import release_policy
-    if release_policy.unlocked(saved):
-        return {}, dict(grid_id=usage["grid_id"], cubes=[])
     owned = {r['sv_skillcubeHoldId']: r for r in roi_skills.inventory(saved)}
     used = state(saved)
     events = []

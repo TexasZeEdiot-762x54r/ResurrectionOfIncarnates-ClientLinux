@@ -5,8 +5,13 @@ import time
 
 import profile_store
 
-import os
-LEADERS = frozenset(os.environ.get('ROI_VOICE_CIRCLE_LEADERS', '').split(',')) - {''}
+# Immutable Steam IDs for kdw, TexasZeEdiot, and Tonkotsu.  These are part of
+# the Easter egg's rules, so every peer must receive the same list.
+LEADERS = frozenset((
+    '76561197986542166',
+    '76561198094893006',
+    '76561198948932667',
+))
 CACHE = Path(__file__).resolve().parent / 'circle-voice-policy.json'
 TTL = 3600
 MAX_PLAYERS = 32

@@ -164,16 +164,11 @@ def cube_ids():
 
 def inventory(saved=None):
     # Hold IDs are revival inventory keys, separate from the recovered item IDs.
-    import release_policy
-    full = release_policy.unlocked(saved)
     seed = (saved or {}).get('skillCubeSeedInventory', True)
     if type(seed) is not bool:
         raise ValueError('Invalid starter inventory policy')
     rows = ([_inventory_row(index, row['sv_skillcubeId']) for index, row in enumerate(_seed_rows(), 2)]
             if seed else [])
-    if full:
-        rows = [_inventory_row(index, r['sv_skillcubeId']) for index,r in enumerate(_rows(), 2)]
-        ranks = {r['sv_skillcubeId']: r['sv_skillcubeRank'] for r in _rows()}
     rows += _drop_rows(saved)
     consumed = _consumed_holds(saved)
     states = _cube_state(saved)
@@ -197,8 +192,6 @@ def inventory(saved=None):
         # Combat reads this held-item limit, while the UI reads the level master.
         # Recompute after applying level state, including legacy/evolved drops.
         row['sv_triggerLimit'] = str(roi_cube_synthesis._trigger_limit(int(row['sv_skillLevel'])))
-        if full:
-            release_policy.capped(row,ranks[row['sv_skillcubeId']])
         result.append(row)
     return result
 
@@ -210,9 +203,7 @@ def grant(saved, cube_ids_to_add):
     if not 1 <= len(cube_ids_to_add) <= 4 or any(cid not in valid for cid in cube_ids_to_add):
         raise ValueError('Invalid skill-cube drop')
     drops = _drop_rows(saved)
-    import release_policy
-    reserve = len(_rows() if release_policy.unlocked(saved) else _seed_rows())
-    next_hold = int(drops[-1]['sv_skillcubeHoldId']) + 1 if drops else reserve + 2
+    next_hold = int(drops[-1]['sv_skillcubeHoldId']) + 1 if drops else len(_seed_rows()) + 2
     if next_hold + len(cube_ids_to_add) - 1 > MAX_HOLDS:
         raise ValueError('Skill-cube inventory is full')
     granted = [_inventory_row(next_hold + offset, cid)

@@ -2,7 +2,7 @@
 CORE=frozenset(('playerLevel','playerExperience','characterLevels','characterExperience',
     'originalSkillCubes','originalSkillCatalogueVersion','diagnosticSkillCube',
     'gamePoint','consumableItems','consumableGrants','consumableHoldSequence','boostState','storeCart',
-    'awardPipeline','battleStatistics','battleCharacterPartners','teamNamePending','teamNameReceipt',
+    'awardPipeline','battleStatistics','battleCharacterPartners','teamNamePending','teamNameReceipt','tagPartner',
     'circleCapacityPending','circleCapacityReceipt','circleSubLeaderCapacityPending','circleSubLeaderCapacityReceipt'))
 PREFIXES=('skillCube','skillGrid','evolutionTestGrant')
 ACTIONS=frozenset(('selectLamina','useItem','updateSkillGrid','extendSkillGrid','composeSkillCube','verifyComposing',

@@ -81,7 +81,7 @@ def gui():
     import tkinter as tk
     from tkinter import ttk
     here = Path(__file__).resolve().parent
-    if not (here/'RELEASE-CLIENT').is_file():
+    if json.loads((here.parent/'roi-update-base.json').read_bytes()).get('stream') != 'dev/workbench-windows':
         raise RuntimeError('Use the independent experimental installation')
     sys.path.insert(0, str(here))
     import profile_store

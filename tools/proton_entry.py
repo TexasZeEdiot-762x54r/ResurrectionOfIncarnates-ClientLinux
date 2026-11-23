@@ -59,7 +59,12 @@ def main():
     if os.environ.get('ROI_STARTUP_DIAGNOSTICS') == '1':
         import startup_diagnostics
         startup_diagnostics.setup(debugger)
-    result = debugger.run(86400, subprocess.list2cmdline(raw))
+    import steam_friend_names
+    names_stop = steam_friend_names.start()
+    try:
+        result = debugger.run(86400, subprocess.list2cmdline(raw))
+    finally:
+        names_stop.set()
     print('Game exit:', result, flush=True)
     return 0 if result == 0 else 1
 

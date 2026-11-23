@@ -114,7 +114,7 @@ def capture(reader):
     # Solo/Team Custom lobby transitions set 3/4; Vs. Bot sets 5.
     # Tutorial/training, replay mode 7 and unknown modes are untouched.
     key = None
-    if mode in (1, 2):
+    if mode in (0, 1, 2):
         try:
             controller = native.pointer(reader, native.pointer(reader, 0x141B87450) + 0x150)
             key = native.read(reader, controller + 0x1ed8, 16).hex()
@@ -143,7 +143,7 @@ def capture(reader):
     value = metadata(raw, native.number(reader, game + 0x238),
                      native.number(reader, state + 0x60, '<Q'))
     if key:
-        if len({p['sv_uid'] for p in value['sv_entries'] if p['sv_uid']!='0'})!=4:
+        if len({p['sv_uid'] for p in value['sv_entries'] if p['sv_uid']!='0'}) < 2:
             return None
         value['revivalRankedMatchKey']=key
     return raw, value, counters
