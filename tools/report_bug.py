@@ -77,7 +77,9 @@ def main():
     summary=input('What were you doing, what happened, and what did you expect?\n> ').strip()
     if not summary:raise ValueError('Please describe the bug before submitting')
     if len(summary)>4000:raise ValueError('Summary exceeds 4000 characters')
-    report=dict(schema=1,report_id=uuid.uuid4().hex,release='R1P',equivalent_workshop='R52W',
+    # R1P is the legacy wire-format discriminator, not the reported client version.
+    report=dict(schema=1,report_id=uuid.uuid4().hex,release='R1P',
+                client_version=record.get('client_version'),
                 steam_id=uid or None,discord_name=name,summary=summary,os=os_info,
                 launch=record)
     preview=folder/(report['report_id']+'-report.json')

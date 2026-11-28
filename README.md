@@ -1,10 +1,10 @@
-# Rise of Incarnates Resurrection R1P
+# Rise of Incarnates Resurrection R5P
 
-Public release based on the verified R52W Workshop gameplay. Public and Workshop share progression but never matchmaking.
+Public release based on the verified R70W Workshop gameplay. Public and Workshop share progression but never matchmaking.
 
 Automatic log upload is disabled. After closing the game, run `Report-Bug.cmd` (Windows) or `bash Report-Bug.sh` (Linux; also works when invoked from fish). Use LaminaBot `/bugreport` in the ROI Resurrection Discord for a private submission code. The script collects only the last launch, prompts for missing SteamID/OS details and your bug summary, and asks before uploading. Your summary and Discord mention appear in the issue thread; logs and SteamID stay private to maintainers.
 
-Do not mix this folder with a Workshop installation. The signed updater uses internal revision 4 for R1P to preserve compatibility with previous public feed revisions.
+Do not mix this folder with a Workshop installation. The signed updater uses internal revision 4 for R5P to preserve compatibility with previous public feed revisions.
 
 Updates come only from the public R#P channel (`stable/windows` or `stable/linux`). Workshop R#W updates never apply to this installation.
 
@@ -16,7 +16,7 @@ verified original assets. Choose one of the two asset routes below.
 
 - Native Steam, signed in to the Steam account you will play with. Steam Flatpak,
   non-Steam shortcuts, and Steam Deck are not verified by this launcher.
-- x86-64 Linux and 64-bit Python 3.10 or newer, with `venv` and `pip` available.
+- x86-64 Linux and 64-bit Python 3.12 or newer, with `venv` and `pip` available.
   Python 3.12 is the current test target. Examples below use `python3`; if that
   command is older than 3.10, use an installed `python3.12` instead in every command.
 - OpenSSH client tools, including `ssh-keygen`, for signed update verification.

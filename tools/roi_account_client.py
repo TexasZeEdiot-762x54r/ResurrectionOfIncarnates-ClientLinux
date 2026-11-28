@@ -23,14 +23,9 @@ class RegistrationError(ValueError):
 
 
 def read_credential(path):
-    try:
-        with path.open('rb') as stream:
-            raw = stream.read(1025)
-    except FileNotFoundError:
-        return None
-    if len(raw) > 1024:
-        raise RegistrationError('Invalid account credential file')
-    value = json.loads(raw)
+    from credential_store import read
+    value=read(path)
+    if value is None:return None
     if (not isinstance(value, dict) or set(value) != {'schema','uid','issuer','token'}
             or type(value['schema']) is not int or value['schema'] != 1 or value['issuer'] != ISSUER
             or not isinstance(value['uid'], str) or not re.fullmatch(r'[1-9][0-9]{0,19}', value['uid'])
@@ -42,7 +37,13 @@ def read_credential(path):
 
 def private_create(path, value):
     """Set a private ACL while empty, then persist the retry credential before sending."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    from credential_store import protect,release
+    protected=protect(value,path)
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except BaseException:
+        release(protected,path)
+        raise
     try:
         if os.name == 'nt' and os.environ.get('ROI_PROTON_PRIVATE') != '1':
             output = subprocess.check_output(['whoami','/user','/fo','csv','/nh'], text=True)
@@ -57,13 +58,14 @@ def private_create(path, value):
             os.fchmod(fd, 0o600)
         with os.fdopen(fd, 'w', encoding='ascii') as stream:
             fd = None
-            json.dump(value, stream, separators=(',', ':'))
+            json.dump(protected, stream, separators=(',', ':'))
             stream.flush()
             os.fsync(stream.fileno())
     except BaseException:
         if fd is not None:
             os.close(fd)
         path.unlink(missing_ok=True)
+        release(protected,path)
         raise
 
 
@@ -129,31 +131,8 @@ def validate_status(value, uid):
 
 
 def ensure(identity, options, directory=HERE):
-    final = directory/'account-auth.json'
-    pending = directory/'account-auth.pending.json'
-    value = read_credential(final)
-    if value is not None:
-        if value['uid'] != identity.uid:
-            raise RegistrationError('This installation belongs to another Steam account; use a separate client folder')
-        status = asyncio.run(exchange(options, 'GET', '/registration/'+identity.uid, value['token']))
-        return validate_status(status, identity.uid)
-    value = read_credential(pending)
-    if value is None:
-        value = dict(schema=1, uid=identity.uid, issuer=ISSUER, token=secrets.token_hex(32))
-        private_create(pending, value)
-    if value['uid'] != identity.uid:
-        raise RegistrationError('Pending registration belongs to another Steam account')
-    # A prior request may have committed even if its response was lost.
-    status = asyncio.run(exchange(options, 'GET', '/registration/'+identity.uid, value['token']))
-    if status is None:
-        status = asyncio.run(exchange(options, 'POST', '/registration', body=dict(
-            uid=identity.uid, token=value['token'], ticket=identity.ticket())))
-    result = validate_status(status, identity.uid)
-    if final.exists():
-        raise RegistrationError('Account credential changed during registration; restart the launcher')
-    # Rename, not replace: never overwrite another launch's credential.
-    pending.rename(final)
-    return result
+    from account_switch import ensure as select_account
+    return select_account(identity, options, directory, sys.modules[__name__], revoke='--sign-out-all' in sys.argv)
 
 
 def main():
@@ -161,17 +140,10 @@ def main():
     from public_tunnel import settings
     from steam_identity import Identity
     try:
+        from account_switch import check_idle
+        check_idle()
         with Identity(paths.GAME_EXE.parent/'steam_api64.dll') as identity:
             options = settings()
-            # Import only the current user's own existing official installation credential,
-            # never a local profile, game state or a credential for a different account.
-            source = os.environ.get('ROI_OFFICIAL_CLIENT')
-            if source and not (HERE/'account-auth.json').exists():
-                other = read_credential(Path(source)/'tools/account-auth.json')
-                if other is None or other['uid'] != identity.uid:
-                    raise RegistrationError('Official installation belongs to another account')
-                validate_status(asyncio.run(exchange(options,'GET','/registration/'+identity.uid,other['token'])),identity.uid)
-                private_create(HERE/'account-auth.json',other)
             result = ensure(identity, options)
             if result.get('progression') != 'server':
                 raise RegistrationError('Live progression is not enabled for this account')
@@ -180,9 +152,16 @@ def main():
             restore(read_credential(HERE/'account-auth.json'),settings(),exchange)
         print('Account authenticated. Existing local-save import remains pending.' if result['progression']=='import_pending'
               else 'Account authenticated; progression is server-owned.')
-    except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError):
-        # Never include transport exception strings, which might contain a ticket.
-        print('For an existing account, set ROI_OFFICIAL_CLIENT to your own official install folder and retry.', file=sys.stderr)
+    except (OSError, ValueError, asyncio.TimeoutError, asyncio.IncompleteReadError) as error:
+        # Report only a bounded category, never transport strings or secrets.
+        from credential_store import StorageError
+        if isinstance(error,StorageError):
+            print('Secure session storage failed. On Linux, install libsecret tools and unlock the desktop keyring; launch through Steam. No plaintext fallback was used.',file=sys.stderr)
+        if isinstance(error, RegistrationError):
+            print('Login stage: '+str(error.stage or 'validation')+'; HTTP '+str(error.http_status or 'n/a'), file=sys.stderr)
+        else:
+            print('Login could not complete: '+type(error).__name__+' (Steam, local files, or connectivity).', file=sys.stderr)
+        print('Sign into Steam online, close other game clients, and retry. Saved credentials for each Steam account are preserved.', file=sys.stderr)
         print('Account registration/login failed. Check Steam and connectivity. Keep account-auth.pending.json for a safe retry; do not delete existing account-auth.json.', file=sys.stderr)
         return 1
     return 0

@@ -256,6 +256,12 @@ def stop_owned(children):
 
 
 def _launch(args):
+    from credential_bridge import running
+    with running(HERE) as storage_env:
+        return _launch_with_storage(args,storage_env)
+
+
+def _launch_with_storage(args,storage_env):
     supported_platform()
     os.environ['ROI_DEPLOYMENT_FILE'] = str(ROOT / 'deployment.local.json')
     verify_package()
@@ -278,6 +284,7 @@ def _launch(args):
         raise ValueError('Use a private user-owned client folder')
     HERE.chmod(0o700)
     env = os.environ.copy()
+    env.update(storage_env)
     env['ROI_PROTON_PRIVATE'] = '1'
     env['ROI_DEPLOYMENT_FILE'] = str(ROOT / 'deployment.local.json')
     env['ROI_GAME_ARGUMENTS_JSON'] = json.dumps(game_args)

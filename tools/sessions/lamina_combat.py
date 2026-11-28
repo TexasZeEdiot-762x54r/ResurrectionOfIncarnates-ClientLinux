@@ -14,6 +14,9 @@ import struct
 import time
 import uuid
 
+from sessions import replay_lamina_track as replay_track
+from sessions import replay_lamina_command as replay_command
+
 ROOT = PureWindowsPath(Path(__file__).resolve().parents[2])
 FLAG_NAME = 'lamina-combat.enabled'
 OPEN, SUMMON, USED = 0x14069AA70, 0x14069AAC0, 0x14069AAD0
@@ -163,7 +166,7 @@ class SummonRecorder:
 
 
 def native_gate(budget, roster=ROSTER, playback=PLAYBACK, registry=REGISTRY, *, used=False,
-                parameter=False, counters=None):
+                parameter=False, counters=None, track=None):
     """Win64 leaf: RCX=wrapper, EAX=bool; only volatile GPRs/flags clobbered.
 
     Addresses are injectable for isolated machine-code tests. Native object
@@ -192,6 +195,15 @@ def native_gate(budget, roster=ROSTER, playback=PLAYBACK, registry=REGISTRY, *, 
         branches.append(len(code))
         code.extend(b'\0' * 4)
 
+    def jump(opcode):
+        emit(opcode)
+        at = len(code)
+        code.extend(b'\0' * 4)
+        return at
+
+    def here(at):
+        struct.pack_into('<i', code, at, len(code) - at - 4)
+
     if parameter:
         # The sole recovered command is index 0 with a 10-frame shot delay.
         emit('85 d2'); reject('85')           # reject other parameter indices
@@ -204,14 +216,22 @@ def native_gate(budget, roster=ROSTER, playback=PLAYBACK, registry=REGISTRY, *, 
     emit('4d 85 c0'); reject('84')
     imm64('48 b8', roster)
     emit('4c 8b 08 4d 85 c9'); reject('84')   # r9 = *roster
-    emit('41 8b 81 50 f6 05 00')            # eax = battle mode
-    emit('83 f8 05'); reject('87')           # unsigned mode > 5 fails
-    emit('ba 3b 00 00 00 0f a3 c2'); reject('83')  # Ranked solo 0/team 1, custom 3/4, Vs. Bot 5
     emit('41 80 79 10 00'); reject('85')
     imm64('48 b8', playback)
     emit('4c 8b 10 4d 85 d2'); reject('84')   # r10 = *playback
-    emit('41 80 7a 08 00'); reject('85')
     emit('41 81 7a 10 f0 05 03 15'); reject('85')
+    emit('41 8b 81 50 f6 05 00')            # eax = battle mode
+    emit('83 f8 07')
+    live_mode = jump('0f 85')
+    emit('41 80 7a 08 01'); reject('85')    # mode 7 must be actual playback
+    emit('41 b9 01 00 00 00')              # r9d = replay marker
+    mode_ready = jump('e9')
+    here(live_mode)
+    emit('83 f8 05'); reject('87')
+    emit('ba 3b 00 00 00 0f a3 c2'); reject('83')  # unchanged live modes
+    emit('41 80 7a 08 00'); reject('85')
+    emit('45 31 c9')
+    here(mode_ready)
     emit('41 0f be 90 71 0c 00 00')           # edx = signed player slot
     emit('83 fa 03'); reject('87')           # unsigned >3 includes negatives
     if counters is not None:
@@ -221,7 +241,33 @@ def native_gate(budget, roster=ROSTER, playback=PLAYBACK, registry=REGISTRY, *, 
     emit('4c 8b 18 4d 85 db'); reject('84')   # r11 = *registry
     emit('48 69 c2 d0 25 00 00')              # rax = slot * 0x25d0
     emit('4d 39 44 03 18'); reject('85')      # registered player identity
-    emit('41 83 bc 03 d4 23 00 00 01'); reject('85')  # human controller; CPUs are 4
+    emit('45 85 c9')
+    live_controller = jump('0f 84')
+    # The replay can present a recorded human with transient controller 4.
+    # The actor's CPU-input flag and retained participant decide eligibility.
+    emit('41 83 b8 a4 c2 00 00 00'); reject('85')
+    emit('41 83 bc 03 d4 23 00 00 00')
+    playback_controller = jump('0f 84')
+    if track is not None and not parameter:
+        emit('41 83 bc 03 d4 23 00 00 04')
+        controller_four = jump('0f 84')
+        emit('41 83 bc 03 d4 23 00 00 01')
+        controller_one = jump('0f 84')
+        emit('41 83 bc 03 d4 23 00 00 03'); reject('85')
+        here(controller_one)
+        imm64('48 b8', track)
+        emit('80 38 02'); reject('85')
+        here(controller_four)
+    else:
+        emit('41 83 bc 03 d4 23 00 00 04'); reject('85')
+    here(playback_controller)
+    emit('48 69 c2 d8 22 00 00')                       # retained participant stride
+    emit('41 80 7c 02 31 00'); reject('8c')            # CPU marker is negative
+    emit('49 83 7c 02 48 00'); reject('84')            # recorded human UID
+    controller_ready = jump('e9')
+    here(live_controller)
+    emit('41 83 bc 03 d4 23 00 00 01'); reject('85')   # live human controller
+    here(controller_ready)
     emit('4d 39 80 58 0c 00 00'); reject('85')
     emit('49 8d 80 f0 0b 00 00')
     emit('49 39 80 60 0c 00 00'); reject('85')
@@ -248,6 +294,40 @@ def native_gate(budget, roster=ROSTER, playback=PLAYBACK, registry=REGISTRY, *, 
         emit('41 83 b8')
         code.extend(struct.pack('<I', offset))
         emit('00'); reject('85')
+    if track is not None and not parameter:
+        imm64('49 ba', track)             # r10 = mode byte followed by frame masks
+        emit('45 0f b6 1a')               # r11d = track mode
+        emit('45 85 c9')                  # r9d = native replay marker
+        replay_mode = jump('0f 85')
+        emit('41 80 fb 01')
+        no_record = jump('0f 85')
+        capture_mode = jump('e9')
+        here(replay_mode)
+        emit('41 80 fb 02')
+        no_playback = jump('0f 85')
+        here(capture_mode)
+        imm64('48 b8', replay_track.STATE)
+        emit('48 8b 00 48 85 c0')
+        no_state = jump('0f 84')
+        emit('8b 40 18 3d 00 40 00 00')
+        bad_frame = jump('0f 83')
+        emit('4d 8d 54 02 01')            # r10 = &masks[frame]
+        emit('89 d1')                     # ecx = slot (edx remains intact)
+        if used:
+            emit('83 c1 04')
+        emit('41 b9 01 00 00 00 41 d3 e1')
+        emit('41 80 fb 02')
+        enforce = jump('0f 84')
+        emit('f0 45 08 0a')               # atomic OR into the live frame mask
+        captured = jump('e9')
+        here(enforce)
+        emit('45 84 0a'); reject('84')     # this frame allowed that live gate
+        admitted = jump('e9')
+        here(no_state)
+        here(bad_frame)
+        emit('41 80 fb 02'); reject('84')  # out of range: preserve live behavior
+        for target in (no_record, no_playback, captured, admitted):
+            here(target)
     if parameter:
         emit('f3 41 0f 11 90 a0 c2 00 00')  # only the local owner's shot field
     if counters is not None:
@@ -683,10 +763,10 @@ def preflight(d, wrapper, *, require_idle=True, allow_result_presentation=False)
     player = pointer(d, wrapper + 0xEF8)
     roster, playback = pointer(d, ROSTER), pointer(d, PLAYBACK)
     mode = number(d, roster + 0x5F650)
-    if mode not in GATE_MODES:
-        raise ValueError('only Ranked modes 0/1, custom modes 3/4 or Vs. Bot mode 5 are permitted')
-    if number(d, playback + 8, '<B') != 0:
-        raise ValueError('replay is forbidden')
+    raw_playback = number(d, playback + 8, '<B')
+    replaying = mode == 7 and raw_playback == 1 and not allow_result_presentation
+    if not replaying and (mode not in GATE_MODES or raw_playback != 0):
+        raise ValueError('unsupported live or replay Lamina context')
     if number(d, playback + 0x10) != 0x150305F0:
         raise ValueError('battle header unavailable')
     slot = number(d, player + 0xC71, '<b')
@@ -698,7 +778,15 @@ def preflight(d, wrapper, *, require_idle=True, allow_result_presentation=False)
         raise ValueError('player is not registered')
     controller = number(d, registry + slot * 0x25D0 + 0x23D4)
     presentation = allow_result_presentation
-    if controller != 1 and not (presentation and controller == 0):
+    if replaying:
+        participant = playback + 0x30 + slot * 0x22D8
+        tracked = getattr(d, 'lamina_replay_is_tracked', None)
+        controllers = (0, 1, 3, 4) if tracked is not None and tracked(playback) else (0, 4)
+        if (controller not in controllers or number(d, player + 0xC2A4) != 0
+                or number(d, participant + 1, '<b') < 0
+                or not number(d, participant + 0x18, '<Q')):
+            raise ValueError('replay participant is not a recorded human')
+    elif controller != 1 and not (presentation and controller == 0):
         raise ValueError('player slot %d is not human-controlled' % slot)
     if pointer(d, player + 0xC58) != player or pointer(d, player + 0xC60) != player + 0xBF0:
         raise ValueError('owner links are incomplete')
@@ -737,7 +825,8 @@ def preflight(d, wrapper, *, require_idle=True, allow_result_presentation=False)
     if pointer(d, wrapper + 0xEF8) != player or number(d, player + 0xC78, '<i') != lamina:
         raise ValueError('player selection changed during inspection')
     return dict(player=player, slot=slot, lamina=lamina, level=level,
-                local_owner=slot == header_slot, presentation=presentation)
+                local_owner=not replaying and slot == header_slot,
+                presentation=presentation, replaying=replaying)
 
 
 def result_owner(d, wrapper):
@@ -1020,12 +1109,91 @@ def setup(d):
         visual_waiting = {}
         deferred_visual = {}
         factory_frames = {}
+        track = replay_track.RoundTrack()
+        track_address = None
+        command_ready = False
+
+        def current_frame():
+            return number(debugger, pointer(debugger, replay_track.STATE) + 0x18)
+
+        def read_track_bytes(address, size, limit):
+            if not (0 < size <= limit and 0x10000 <= address <= 0x7FFFFFFFFFFF-size):
+                raise ValueError('Invalid Lamina track range')
+            data = debugger.read(address, size)
+            if len(data) != size:
+                raise ValueError('Incomplete Lamina track read')
+            return data
+
+        def begin_track():
+            track.reset()
+            if track_address is None:
+                return
+            try:
+                checked_write(debugger, track_address, b'\0')
+                manager = pointer(debugger, PLAYBACK)
+                mode = number(debugger, pointer(debugger, ROSTER) + 0x5F650)
+                playing = number(debugger, manager + 8, '<B')
+                if mode == 5 and playing == 0:
+                    checked_write(debugger, track_address+1, bytes(replay_track.FRAME_LIMIT))
+                    checked_write(debugger, track_address, b'\1')
+                    track.mode, track.manager = 1, manager
+                elif mode == 7 and playing == 1:
+                    start = manager+0x10
+                    magic = replay_track.MAGIC
+                    if read_track_bytes(start+replay_track.OFFSET, len(magic), len(magic)) != magic:
+                        return
+                    raw = read_track_bytes(start, replay_track.RAW_SIZE, replay_track.RAW_SIZE)
+                    value = replay_track.extract(raw)
+                    if value is not None:
+                        last, masks, events = value
+                        checked_write(debugger, track_address+1, masks.ljust(replay_track.FRAME_LIMIT, b'\0'))
+                        if command_ready:
+                            checked_write(debugger, track_address+1+replay_track.FRAME_LIMIT,
+                                          replay_command.event_masks(events))
+                        checked_write(debugger, track_address, b'\2')
+                        track.mode, track.manager = 2, manager
+                        track.expected = set(events)
+                        debugger.log(f'REPLAY_LAMINA loaded {len(events)} confirmed summons; live end frame={last}')
+            except READ_ERRORS as exc:
+                debugger.log(f'REPLAY_LAMINA track unavailable: {type(exc).__name__}')
+
+        def capture_track(raw, manager, frame):
+            if track.mode != 1 or track.manager != manager or not track.complete:
+                return raw
+            if not 0 < frame < replay_track.FRAME_LIMIT:
+                return raw
+            try:
+                masks = read_track_bytes(track_address+1, frame+1, replay_track.FRAME_LIMIT)
+                value = replay_track.embed(raw, frame, masks, track.confirmed)
+            except READ_ERRORS:
+                debugger.log('REPLAY_LAMINA track did not fit or did not match the native round')
+                return raw
+            debugger.log(f'REPLAY_LAMINA recorded {len(track.confirmed)} confirmed summons; end frame={frame}')
+            return value
 
         def inspect(hit):
             return preflight(debugger, hit.rcx,
                              allow_result_presentation=result_ready[0])
 
+        replay_timing = (Path(__file__).resolve().parent.parent / 'replay-trace.enabled').is_file()
+        timing_left = 32
+
         def summon(hit):
+            nonlocal timing_left
+            if replay_timing and timing_left:
+                timing_left -= 1
+                try:
+                    manager = pointer(debugger, 0x141B874D0)
+                    state = pointer(debugger, 0x141B87440)
+                    actor = pointer(debugger, hit.rcx + 0xEF8)
+                    timing = dict(frame=number(debugger, state + 0x18),
+                                  playback=number(debugger, manager + 8, '<B'),
+                                  slot=number(debugger, actor + 0xC71, '<b'),
+                                  gate=number(debugger, budget, '<B'),
+                                  results=result_ready[0])
+                    debugger.log('REPLAY_TRACE summon_request ' + repr(timing))
+                except READ_ERRORS:
+                    pass
             started = time.perf_counter()
             try:
                 saved_events(debugger)
@@ -1069,6 +1237,16 @@ def setup(d):
                     checked_write(debugger, budget, b'\0')
                     raise ValueError('experimental opt-in or isolation was removed')
                 values = values or inspect(hit)
+                if track.mode and not values['presentation']:
+                    event = (current_frame(), values['slot'], values['lamina'], values['level'])
+                    manager = pointer(debugger, PLAYBACK)
+                    # Duplicate and unconfirmed factory calls must not add
+                    # actors during playback of a tracked battle.
+                    if values['replaying'] and not track.admit(manager, event):
+                        hit.skip_call(0)
+                        return
+                    if not values['replaying']:
+                        values = dict(values, replay_track_event=event)
                 checked_write(debugger, budget, b'\0')
                 resources = [(values['lamina'], 2 if values['lamina'] == 3 else 1)]
                 if values['lamina'] == 4:
@@ -1287,7 +1465,10 @@ def setup(d):
                     raise ValueError('experimental profile path escaped clone')
                 if not attempt['presentation']:
                     capacity = refill_summon_charges(debugger, attempt)
-                if attempt['local_owner'] and not attempt['presentation']:
+                save_queued = attempt['local_owner'] and not (attempt['presentation'] or attempt['replaying'])
+                if attempt.get('replay_track_event') is not None:
+                    track.confirm(pointer(debugger, PLAYBACK), attempt['replay_track_event'])
+                if save_queued:
                     recorder.submit(roi_lamina.record_summon, store, attempt['lamina'], launch_id,
                                     attempt['event_id'], variant=attempt['level'])
                 if not visual_waiting and not (pending[0] or loading[0]):
@@ -1298,7 +1479,7 @@ def setup(d):
                     debugger.log(f'LAMINA_GATE report unavailable: {gate_exc}')
                 debugger.log('LAMINA_COMBAT native initialization returned ' + json.dumps(dict(
                     actors=attempt['actors'],
-                    save_queued=attempt['local_owner'] and not attempt['presentation'],
+                    save_queued=save_queued, replaying=attempt['replaying'],
                     presentation=attempt['presentation'], event_id=attempt['event_id'],
                     test_charges=capacity,
                     callback_ms=round((time.perf_counter() - started) * 1000, 3),
@@ -1515,11 +1696,32 @@ def setup(d):
             checked_write(debugger, budget, b'\0\0')
             counters = budget + COUNTERS_OFFSET
             checked_write(debugger, counters, b'\0' * 32)
-            open_code = native_gate(budget, counters=counters)
-            used_code = native_gate(budget, used=True)
+            command = replay_command.COMMAND
+            prologue = replay_command.STOLEN
+            command_ready = (not any(command <= a < command+len(prologue) for a in debugger.bps)
+                             and debugger.read(command, len(prologue)) == prologue)
+            originals = dict(SITES)
+            track_address = debugger.alloc((2 if command_ready else 1)*replay_track.FRAME_LIMIT+1)
+            if not track_address:
+                track_address = None
+            if track_address is not None:
+                checked_write(debugger, track_address, b'\0')
+            open_code = native_gate(budget, counters=counters, track=track_address)
+            used_code = native_gate(budget, used=True, track=track_address)
             open_entry, used_entry = budget + 16, budget + 16 + len(open_code)
             parameter_entry = used_entry + len(used_code)
             all_code = bytearray(open_code + used_code + native_gate(budget, parameter=True))
+            patch_targets = [(USED, used_entry), (OPEN, open_entry), (PARAM, parameter_entry)]
+            command_ready = command_ready and track_address is not None
+            if command_ready:
+                original_entry = open_entry + len(all_code)
+                all_code.extend(prologue + gate_jump(command+len(prologue)))
+                command_entry = open_entry + len(all_code)
+                all_code.extend(replay_command.command_thunk(
+                    track_address, track_address+1+replay_track.FRAME_LIMIT,
+                    replay_track.STATE, open_entry, original_entry))
+                patch_targets.append((command, command_entry))
+                originals[command] = prologue
             bootstrap_entries = {}
             for lamina, (constructor, _) in CONSTRUCTORS.items():
                 entry = open_entry + len(all_code)
@@ -1555,14 +1757,17 @@ def setup(d):
                 debugger.bp(address, handler)
                 if debugger.read(address, 1) != b'\xcc':
                     raise OSError('breakpoint installation did not verify')
-            for address, target in ((USED, used_entry), (OPEN, open_entry), (PARAM, parameter_entry)):
+            for address, target in patch_targets:
                 patched.append(address)
-                checked_write(debugger, address, gate_jump(target))
+                entry = gate_jump(target)
+                if address == command:
+                    entry = entry[:len(prologue)]
+                checked_write(debugger, address, entry)
             # Last write enables eligibility only after both gates and handlers verify.
             checked_write(debugger, budget, b'\x01')
         except Exception:
             failures = []
-            for address, raw in [(budget, b'\0\0')] + [(a, SITES[a]) for a in patched]:
+            for address, raw in [(budget, b'\0\0')] + [(a, originals[a]) for a in patched]:
                 try:
                     checked_write(debugger, address, raw)
                 except OSError as exc:
@@ -1577,6 +1782,9 @@ def setup(d):
                 raise RuntimeError('Lamina rollback incomplete; stop this experimental process: '
                                    + '; '.join(failures))
             raise
+        debugger.lamina_replay_is_tracked = lambda manager: track.mode == 2 and track.manager == manager
+        debugger.lamina_replay_begin = begin_track
+        debugger.lamina_replay_capture = capture_track
         # The launcher already owns this scene hook. Preserve its original byte
         # and callback rather than registering a competing breakpoint.
         if MENU_SCENE in debugger.bps:

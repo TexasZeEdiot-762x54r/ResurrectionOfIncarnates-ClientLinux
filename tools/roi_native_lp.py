@@ -116,6 +116,7 @@ def handle(path, owner, character, data, *, trusted=False):
         return {'enabled': False}
     action = data.get('action')
     fields = {
+        'ranked_wear': {'match_key', 'cube_usage'},
         'open': set(), 'begin_custom': {'sequence', 'match_key'},
         'stage_bot': {'battle_id', 'report', 'summary'},
         'settle_custom': {'sequence', 'match_key', 'battle_id', 'outcome', 'summary'},
@@ -147,6 +148,12 @@ def handle(path, owner, character, data, *, trusted=False):
             return {'enabled': True}
         if bridge.get('launch') != launch or bridge.get('owner') != str(owner):
             raise ValueError('Native bridge session changed')
+        if action == 'ranked_wear':
+            import ranked_cube_wear
+            changes, wear = ranked_cube_wear.stage(saved, state, owner, data['match_key'], cube_usage)
+            changes['awardPipeline'] = state
+            profile_store.update(path, changes)
+            return dict(enabled=True, cube_wear=wear)
         if action == 'receipt':
             battle_id = str(awards.integer(data['battle_id'], 1))
             if data['mode'] not in ('bot', 'custom'):

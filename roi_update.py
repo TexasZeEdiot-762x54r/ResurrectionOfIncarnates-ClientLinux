@@ -25,7 +25,7 @@ STATE = '.roi-update'
 
 
 def release_label(revision):
-    return '2.06 - R'+str(revision-3)+'P' if revision>=4 else '2.06 - R'+str(revision)
+    return '2.07 - R'+str(revision-3)+'P' if revision>=4 else '2.07 - R'+str(revision)
 
 def require(ok, msg):
     if not ok:

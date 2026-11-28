@@ -112,7 +112,7 @@ def stage_master():
 
 def const():
     return [{
-        "sv_clientVer": "2.06",          # compared with the client's own "2.06" (parser 0x1400aab10)
+        "sv_clientVer": "2.07",          # Must match the native version literal (parser 0x1400aab10).
         "sv_circleSubLeaderExpandMax": "0", "sv_circleMemberExpandMax": "0",
         "sv_circleSubLeaderExpandCost": "0", "sv_circleMemberExpandCost": "0",
         "sv_circleAbsorptionCost": "0", "sv_changeTagNameCost": "0",

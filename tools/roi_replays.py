@@ -247,6 +247,20 @@ def find(path, owner, data):
         for ident, stamp, metadata in rows:
             row = stored_metadata(ident, stamp, metadata, owner)
             row.update(sv_replayId=ident, sv_saveTime=str(stamp))
+            # View Battle never received a distinct lobby type for local
+            # Vs. Bot. Read the validated recording header only for those rows
+            # and project a display type without modifying stored metadata.
+            if row['sv_roomType'] == '0' and query.get('sv_roomType', 0) in (0, 5):
+                if not matches(row, {k:v for k,v in query.items() if k != 'sv_roomType'}):
+                    continue
+                payload, = db.execute('SELECT payload FROM replays WHERE id=? AND owner=?',
+                                      (ident, owner)).fetchone()
+                try:
+                    raw = decode_payload(payload)
+                except ValueError:
+                    continue
+                if struct.unpack_from('<i', raw, 0x14)[0] == 5:
+                    row['sv_roomType'] = '5'
             if matches(row, query):
                 found.append(row)
                 if len(found) == MAX_RESULTS:

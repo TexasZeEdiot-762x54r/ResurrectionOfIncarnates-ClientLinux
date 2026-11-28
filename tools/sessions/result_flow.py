@@ -23,7 +23,108 @@ def snapshot(d):
                 nrt_wait=d.d32(nrt+0x40c8) if nrt else None)
 
 
+SOLO_PROMPT_SITE = 0x1404C855C
+SOLO_PROMPT_STAGE_CHECK = 0x1404C856A
+SOLO_PROMPT_NO = 0x1404D2ED0
+SOLO_PROMPT_YES = 0x1404D2E50
+SOLO_PROMPT_YES_RETURN = 0x1404D2E5A
+SOLO_PROMPT_TEXT = 0x1404D2ADD
+SOLO_PROMPT_GUARDS = {
+    0x1404D2E42: bytes.fromhex('488b050f466b0144888252030000'),
+    SOLO_PROMPT_YES: bytes.fromhex('c78084f60500010000004883c428c3'),
+    0x1404D2AC6: bytes.fromhex('488d9424900000004883c130c7842490000000c9b60600'),
+    SOLO_PROMPT_TEXT: bytes.fromhex('e88e830b00'),
+    0x1404D3197: bytes.fromhex('8b422c83f801740cc74520c9b6060083f8047507c74520d8b60600'),
+    0x1404C8557: bytes.fromhex('83f9057559418b422c83f801745083f804744b'),
+    SOLO_PROMPT_STAGE_CHECK: bytes.fromhex('418b8180f60500ffc03bc17f3e'),
+    0x1404C8585: bytes.fromhex('4c8d0d346d6e01e8bf02310048898788000000'),
+    0x1404D2EC9: bytes.fromhex('44888252030000898884f60500'),
+}
+
+
+def solo_win_with_next_stage(d):
+    state, roster, stages, playback = (d.q(address) for address in (
+        0x141B87440, 0x141B87458, 0x141B87470, 0x141B874D0))
+    if not all((state, roster, stages, playback)):
+        return None
+    if (d.read(playback+8, 1) != b'\0' or d.d32(roster+0x5F650) != 5
+            or d.d32(roster+0x5F67C) not in (0, 1)
+            or d.d32(state+0x2C) not in (1, 4) or d.d32(state+0x58) != 0
+            or d.d32(roster+0x5F688) != 0):
+        return None
+    stage = d.d32(roster+0x5F680)
+    phase_count = d.d32(stages+0x10)
+    if not 1 <= phase_count <= 100:
+        return None
+    if d.d32(roster+0x5F67C) == 0:
+        phase_count = min(3, phase_count)
+    if not 0 <= stage or stage+1 >= phase_count:
+        return None
+    return state, roster, stage
+
+
+def setup_solo_prompt(d):
+    offered = None
+
+    def arm(debugger):
+        if (any(site in getattr(debugger, 'bps', {}) for site in (SOLO_PROMPT_SITE, SOLO_PROMPT_NO, SOLO_PROMPT_TEXT, SOLO_PROMPT_YES))
+                or any(debugger.read(address, len(raw)) != raw
+                       for address, raw in SOLO_PROMPT_GUARDS.items())):
+            debugger.log('SOLO_BOT_PROMPT disabled: native contract unavailable')
+            return
+
+        def offer(hit):
+            nonlocal offered
+            offered = None
+            round_info = solo_win_with_next_stage(debugger)
+            if round_info is None or (hit.r10, hit.r9) != round_info[:2]:
+                return
+            offered = round_info
+            # Rejoin the existing constructor path at its stage-limit check.
+            hit.setreg('rip', SOLO_PROMPT_STAGE_CHECK)
+            debugger.log('SOLO_BOT_PROMPT offering native continue or main menu')
+
+        def leave(hit):
+            nonlocal offered
+            if offered is None or hit.rax != offered[1]:
+                return
+            if offered != solo_win_with_next_stage(debugger):
+                return
+            # The No callback's original store clears the retry flag; wins
+            # still qualify for advance unless the native end-run flag is set.
+            if debugger.write(hit.rax+0x5F688, b'\x01\0\0\0'):
+                offered = None
+                debugger.log('SOLO_BOT_PROMPT main menu selected; next stage skipped')
+
+        def label(hit):
+            if offered is None or offered != solo_win_with_next_stage(debugger):
+                return
+            if hit.rdx != hit.rsp+0x90 or debugger.d32(hit.rdx) != 0x6B6C9:
+                return
+            # The team popup already uses this localized next-stage question on wins.
+            debugger.write(hit.rdx, (0x6B6D8).to_bytes(4, 'little'))
+
+        def advance(hit):
+            nonlocal offered
+            if offered is None or hit.rax != offered[1]:
+                return
+            if offered != solo_win_with_next_stage(debugger):
+                return
+            # A win already qualifies for native stage advance. Do not mark it as a retry.
+            hit.setreg('rip', SOLO_PROMPT_YES_RETURN)
+            offered = None
+            debugger.log('SOLO_BOT_PROMPT next stage selected; using normal win progression')
+
+        debugger.bp(SOLO_PROMPT_YES, advance)
+        debugger.bp(SOLO_PROMPT_TEXT, label)
+        debugger.bp(SOLO_PROMPT_SITE, offer)
+        debugger.bp(SOLO_PROMPT_NO, leave)
+
+    d.on_start(arm)
+
+
 def setup(d):
+    setup_solo_prompt(d)
     budget=[30]
     legacy_budget=[6]
     active_mail=[False]

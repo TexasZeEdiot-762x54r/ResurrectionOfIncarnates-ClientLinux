@@ -29,7 +29,7 @@ LP_FIELDS = ((0x84, '2'), (0xA8, '5'), (0xAC, '6'))
 RANKED_LP_FIELDS = ((0xA8, '2'), (0xAC, '5'), (0x84, '6'))
 RANKED_STAT_WORD = 0x1400EADAB
 STAT_GUARD = bytes.fromhex('4a8b9c2ee83d050033c0488945c04889')
-RPC_ACTIONS = frozenset(('open', 'begin_custom', 'stage_bot', 'settle_custom', 'receipt'))
+RPC_ACTIONS = frozenset(('open', 'begin_custom', 'stage_bot', 'settle_custom', 'receipt', 'ranked_wear'))
 RPC_TIMEOUTS = (1.0, 3.0)
 
 
@@ -233,7 +233,7 @@ def ranked_summary_words(reader):
     return words
 
 
-def fetch_ranked(context, cancelled):
+def fetch_ranked(context, cancelled, rpc=None):
     import roi_progression_client as api
     uid = context['uid']
     try:
@@ -241,12 +241,30 @@ def fetch_ranked(context, cancelled):
         if not token:
             return
         deadline = time.monotonic() + 30
+        wear_sent = False
         while not cancelled.is_set() and time.monotonic() < deadline:
             try:
+                if not wear_sent and rpc is not None and 'cube_usage' in context:
+                    try:
+                        rpc('ranked_wear', match_key=context['battle_id'], cube_usage=context['cube_usage'])
+                        wear_sent = True
+                    except (OSError, ValueError, IncompleteRead):
+                        pass
                 doc = api.request('http://127.0.0.1:52713/progress/' + uid, uid, token)
                 receipt = doc['fields'].get('awardPipeline', {}).get('ranked_display')
                 row = ranked_row(receipt, context)
                 if row is not None:
+                    if rpc is not None and 'cube_usage' in context and 'cube_usage' not in receipt:
+                        try:
+                            wear = rpc('ranked_wear', match_key=context['battle_id'], cube_usage=context['cube_usage'])
+                            row['cube_wear'] = wear.get('cube_wear')
+                        except (OSError, ValueError, IncompleteRead):
+                            # Keep reward presentation independent of a retryable wear request.
+                            context['row'] = row
+                            cancelled.wait(0.6)
+                            continue
+                    else:
+                        row['cube_wear'] = receipt.get('cube_wear')
                     context['row'] = row
                     return
             except api.Unavailable:
@@ -410,8 +428,8 @@ class Bridge:
                     self.cubes.clear()
                     self.notices.clear()
                     self.context = dict(mode='ranked', battle_id=key, uid=uid,
-                                        expires=time.monotonic() + 45, summary=None)
-                    threading.Thread(target=fetch_ranked, args=(self.context, self.ranked_cancel),
+                                        expires=time.monotonic() + 45, summary=None, **self.cube_fields())
+                    threading.Thread(target=fetch_ranked, args=(self.context, self.ranked_cancel, self.rpc),
                                      daemon=True).start()
                     roster = native.pointer(self.d, 0x141B87458)
                     outcome = native.number(self.d, roster + 0x53d6a, '<H') if roster else None

@@ -37,7 +37,7 @@ class Pending:
     def valid(self, body):
         return (isinstance(body, dict) and set(body) == {'session', 'version', 'build', 'logs'}
                 and isinstance(body['session'], str) and re.fullmatch('[0-9a-f]{32}', body['session'])
-                and isinstance(body['version'], str) and re.fullmatch(r'2\.06 - R[1-9][0-9]{0,8}', body['version'])
+                and isinstance(body['version'], str) and re.fullmatch(r'2\.0[67] - R[1-9][0-9]{0,8}', body['version'])
                 and isinstance(body['build'], str) and re.fullmatch('[0-9a-f]{64}', body['build'])
                 and isinstance(body['logs'], dict) and 1 <= len(body['logs']) <= len(self.allowed)
                 and all(k in self.allowed and isinstance(v, str) and len(v) <= 2600

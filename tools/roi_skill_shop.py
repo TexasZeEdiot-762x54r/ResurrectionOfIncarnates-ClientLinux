@@ -173,12 +173,13 @@ def add(saved, data):
         raise ValueError('Grid purchasing is unavailable')
     if str(item.get('sv_storeItemId')) != STORE_ID:
         raise ValueError('Unsupported shop item')
-    roi_skills.integer(item.get('sv_storeItemCount'), 1, 1)
+    count = roi_skills.integer(item.get('sv_storeItemCount'), 1,
+                               roi_skills.MAX_GRIDS - len(roi_skills.grids(saved)))
     if len(roi_skills.grids(saved)) >= roi_skills.MAX_GRIDS:
         raise ValueError('All loadouts are owned')
     # Retried addToCart replaces the single-item cart rather than duplicating it.
     rows = [{'sv_storeItemId': STORE_ID, 'sv_storeOrderId': '1', 'sv_resultCode': '0',
-             'sv_storeItemDesc': NAME_QUOTE, 'sv_storeItemCount': '1',
+             'sv_storeItemDesc': NAME_QUOTE, 'sv_storeItemCount': str(count),
              'sv_items': [{'sv_itemId': ITEM_ID}], **catalogue.quote(STORE_ID)}]
     return {'skillGridCart': rows}
 
@@ -250,8 +251,13 @@ def buy(saved, data):
         raise ValueError('No grid order to purchase')
     catalogue.verify_quote(rows[0])
     balance = roi_skills.integer(saved.get('gamePoint', 0), 0, 2147483647)
-    price = cost(saved)
+    count = roi_skills.integer(rows[0].get('sv_storeItemCount'), 1,
+                               roi_skills.MAX_GRIDS - len(roi_skills.grids(saved)))
+    price = cost(saved) * count
     if balance < price:
         raise ValueError('Insufficient LP')
-    return {'skillGrids': roi_skills.add_grid(saved), 'gamePoint': balance - price,
+    working = deepcopy(saved)
+    for _ in range(count):
+        working['skillGrids'] = roi_skills.add_grid(working)
+    return {'skillGrids': working['skillGrids'], 'gamePoint': balance - price,
             'skillGridCart': []}, rows

@@ -20,7 +20,7 @@ def label(root=None):
         rev=data['revision']
         if (data['game']=='rise-of-incarnates/2.06' and data['format']==1
                 and data['stream']==base['stream'] and type(rev) is int and 1<=rev<=999999999):
-            return f'2.06 - R{rev-3}P' if base['stream'].startswith('stable/') and rev>=4 else f'2.06 - R{rev}'
+            return f'2.07 - R{rev-3}P' if base['stream'].startswith('stable/') and rev>=4 else f'2.07 - R{rev}'
     except (OSError,KeyError,TypeError,ValueError,RecursionError):
         pass
     return None

@@ -25,11 +25,15 @@ def readiness(reader):
     mode = native.number(reader, roster + 0x5F650)
     # This is only the 32-byte fixed header, never names, inputs or payload.
     header = native.read(reader, manager + 0x10, 32)
-    states = []
+    states, health = [], []
     for slot in range(6):
         actor = native.number(reader, actors + slot * 0x25D0 + 0x18, '<Q')
         states.append(native.number(reader, actor + 0xC2A4) if actor else None)
-    return dict(mode=mode, playback=playback,
+        if slot < 4:
+            hp = native.number(reader, actor + 0xC88, '<f') if actor else None
+            health.append(round(hp, 2) if hp is not None and -10000 <= hp <= 100000 else None)
+    frame = native.number(reader, native.pointer(reader, 0x141B87440) + 0x18)
+    return dict(mode=mode, playback=playback, frame=frame, fighter_hp=health,
                 version_ok=struct.unpack_from('<I', header)[0] == 0x150305F0,
                 header_counter=struct.unpack_from('<i', header, 0x18)[0],
                 actor_states=states, mode_skips_autosave=5 <= mode <= 7)
@@ -64,22 +68,31 @@ class Trace:
 
 
 def setup(d, *, enabled=None):
-    if not (FLAG.is_file() if enabled is None else enabled):
-        return False
+    enabled = FLAG.is_file() if enabled is None else enabled
+    hooks = HOOKS if enabled else {'initialized': HOOKS['initialized']}
     trace = Trace(d)
 
     def arm(debugger):
         # Validate the whole set before registering any breakpoint.
         if any(debugger.read(address, len(expected)) != expected
-               for address, expected in HOOKS.values()):
+               for address, expected in hooks.values()):
             debugger.log('REPLAY_TRACE disabled: unexpected native code')
             return
-        if any(address in getattr(debugger, 'bps', {}) for address, _ in HOOKS.values()):
+        if any(address in getattr(debugger, 'bps', {}) for address, _ in hooks.values()):
             debugger.log('REPLAY_TRACE disabled: breakpoint already owned')
             return
-        for name, (address, _) in HOOKS.items():
-            debugger.bp(address, lambda hit, event=name: trace.event(event, hit))
-        debugger.log('REPLAY_TRACE bounded read-only readiness diagnostics armed')
+        def observe(hit, event):
+            if event == 'initialized':
+                begin = getattr(debugger, 'lamina_replay_begin', None)
+                if begin is not None:
+                    begin()
+            if enabled:
+                trace.event(event, hit)
+
+        for name, (address, _) in hooks.items():
+            debugger.bp(address, lambda hit, event=name: observe(hit, event))
+        if enabled:
+            debugger.log('REPLAY_TRACE bounded readiness diagnostics armed')
 
     d.on_start(arm)
     return True

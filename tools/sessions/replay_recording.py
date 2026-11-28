@@ -146,6 +146,9 @@ def capture(reader):
         if len({p['sv_uid'] for p in value['sv_entries'] if p['sv_uid']!='0'}) < 2:
             return None
         value['revivalRankedMatchKey']=key
+    capture_track = getattr(reader, 'lamina_replay_capture', None)
+    if capture_track is not None:
+        raw = capture_track(raw, manager, frame)
     return raw, value, counters
 
 
@@ -227,7 +230,34 @@ class Recorder:
             self.d.log('REPLAY_RECORD capture skipped: ' + detail)
 
 
+# The View Battle card defaults to quote 450186 (Ranked) before checking
+# room type 3 for Custom. Only the display-only type 5 uses quote 380035.
+LABEL_SITE = 0x1403e5ef8
+LABEL_GUARDS = (
+    (0x1403e5eee, bytes.fromhex('c785600200008ade06004883c130e86f4f1a00')),
+    (0x1403e5f21, bytes.fromhex('83bb3c04000003753b')),
+)
+
+
+def setup_battle_labels(d):
+    def arm(debugger):
+        if LABEL_SITE in getattr(debugger, 'bps', {}) or any(
+                debugger.read(address, len(expected)) != expected for address,expected in LABEL_GUARDS):
+            debugger.log('REPLAY_LABEL type override skipped: native card signature differs')
+            return
+
+        def select(hit):
+            if debugger.read(hit.rbx + 0x43c, 4) == struct.pack('<I', 5):
+                debugger.write(hit.rbp + 0x260, struct.pack('<I', 380035))
+
+        debugger.bp(LABEL_SITE, select)
+        debugger.log('REPLAY_LABEL View Battle Vs. Bot card override armed')
+
+    d.on_start(arm)
+
+
 def setup(d, *, enabled=None):
+    setup_battle_labels(d)
     if not (FLAG.is_file() if enabled is None else enabled):
         return False
     recorder = Recorder(d)

@@ -80,7 +80,10 @@ def begin(root):
         if not previous.get('closed'):
             finish(root, previous['session'], recovered=True)
     started = time.time()
+    from client_version import label
+    version = label(root)
     item = dict(schema=1, session=uuid.uuid4().hex, started=started, closed=False,
+                client_version=version,
                 os=operating_system(), before={n:stamp(here/'logs'/n) for n in FILES})
     save(current, item)
     return item['session']
@@ -132,6 +135,7 @@ def finish(root, session, recovered=False):
     except (OSError,ValueError):
         steam_id=None
     record=dict(schema=1,session=session,started=item['started'],ended=time.time(),
+                client_version=item.get('client_version'),
                 steam_id=steam_id,os=item['os'],logs=logs,warnings=warnings,
                 recovered_after_unclosed_launch=recovered)
     save(folder/(session+'.json'),record)

@@ -62,15 +62,10 @@ def exchange(target,uid,token,body,timeout,fresh=False):
     finally:pool.put(connection)
 
 def credential(uid):
-    try:
-        with KEY_FILE.open('rb') as stream:raw=stream.read(1025)
-    except FileNotFoundError:return None
-    if len(raw)>1024:raise Unavailable('Invalid account credential file')
-    try:value=json.loads(raw)
-    except ValueError:raise Unavailable('Invalid account credential file') from None
-    if (not isinstance(value,dict) or set(value)!={'schema','uid','issuer','token'} or value['schema']!=1
-            or not isinstance(value['token'],str) or not re.fullmatch(r'[0-9a-f]{64}',value['token'])):
-        raise Unavailable('Invalid account credential file')
+    from roi_account_client import read_credential
+    try:value=read_credential(KEY_FILE)
+    except (OSError,ValueError):raise Unavailable('Protected credential unavailable; relaunch through Steam') from None
+    if value is None:return None
     if value['uid']!=str(uid):return None
     # lobby_server() reloads paths concurrently; its module-level _cfg is briefly
     # empty during reload. Validate against one complete on-disk snapshot instead.

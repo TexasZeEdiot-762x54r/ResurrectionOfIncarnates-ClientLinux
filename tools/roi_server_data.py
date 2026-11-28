@@ -159,6 +159,9 @@ def circle_action(action, data):
                     STATE.get('name', 'LocalPlayer'), action, circle_name_reads.request_data(data))))
         result = roi_circles.request(relay_url(f'/circle/{pid()}'), relay_credential(), pid(),
                                     STATE.get('name', 'LocalPlayer'), action, data)
+        if action in ('getCircleInfo', 'getCircleMemberList'):
+            import replay_picker_names
+            result = dict(result, data=replay_picker_names.enrich(result['data'], fetch_profile))
         membership = {'uid': pid(), 'id': result['circle_id']}
         save(circleMembership=membership)
         if action in ('getCircleInfo', 'setupCircle'):
@@ -447,24 +450,32 @@ def custom_slots(cid, snapshot=None, items=None):
     return [explicit_custom_slot(cid, slots.get(str(i), [0] * 9), items) for i in range(count)]
 
 
-@call("updateCustomize")
-def update_customize(data):
-    # {"sv_charaId": 1, "sv_slotNum": 0, "sv_customItemHoldIds": [head, costume, weapon, acce x3, 0, 0, 0]}
-    cid, slot = str(data.get("sv_charaId")), str(data.get("sv_slotNum", 0))
-    allslots = saved().get("customSlots", {})
-    allslots.setdefault(cid, {})[slot] = [int(x) for x in data.get("sv_customItemHoldIds", [])]
-    save(customSlots=allslots)
+def outfit_operation(action, data):
+    import outfit_client
+    uid = pid()
+    try:
+        outfit_client.mutate(relay_url(f'/progress/{uid}'), uid, action, data)
+    except outfit_client.DEFERRED:
+        return {'result': 'NG', 'time': str(int(time.time())), 'data': {}}
     publish_profile()
     return ok({})
+
+
+@call("updateCustomize")
+def update_customize(data):
+    return outfit_operation('outfitSave', {
+        'sv_charaId': data.get('sv_charaId'),
+        'sv_slotNum': data.get('sv_slotNum', 0),
+        'sv_customItemHoldIds': data.get('sv_customItemHoldIds'),
+    })
 
 
 @call("changeActiveCustomizeSlot")
 def change_active_customize_slot(data):
-    active = saved().get("activeCustomSlot", {})
-    active[str(data.get("sv_charaId"))] = int(data.get("sv_slotNum", data.get("sv_activeCustomSlotNum", 0)))
-    save(activeCustomSlot=active)
-    publish_profile()
-    return ok({})
+    return outfit_operation('outfitSelect', {
+        'sv_charaId': data.get('sv_charaId'),
+        'sv_slotNum': data.get('sv_slotNum', data.get('sv_activeCustomSlotNum')),
+    })
 
 
 def tutorial_map():
@@ -501,7 +512,11 @@ def profile():
         skill_profile = saved(refresh_lamina=True)
         skill_grids = roi_skills.grids(skill_profile)
         skill_inventory = roi_skills.inventory(skill_profile)
-    good_counts = commendation_sync.counts(skill_profile, pid())
+    import outfit_client
+    uid = pid()
+    outfit_fields = outfit_client.fields(relay_url(f'/progress/{uid}'), uid, skill_profile, SAVE_FILE)
+    skill_profile = dict(skill_profile, **outfit_fields)
+    good_counts = commendation_sync.counts(skill_profile, uid)
     chars = []
     for cid in sorted(roi_data.CHARACTERS):
         items = roi_custom.owned(cid)
@@ -1002,11 +1017,20 @@ def save_replay(data):
         return {'result': 'NG', 'time': str(int(time.time())), 'data': {}}
 
 
+def _replay_for_native(row):
+    # Only the label changed in 2.07; the validated replay layout is unchanged.
+    if row.get('sv_replayVer') == '2.06_150305f0':
+        return {**row, 'sv_replayVer': '2.07_150305f0'}
+    return row
+
+
 @call('findReplay')
 def find_replay(data):
     import roi_replays
     import sqlite3
     try:
+        if isinstance(data, dict) and data.get('sv_replayVer') == '2.07_150305f0':
+            data = {**data, 'sv_replayVer': roi_replays.VERSION}
         rows=roi_replays.find(replay_archive(), pid(), data)
         import roi_shared_replays
         remote=[]
@@ -1014,7 +1038,7 @@ def find_replay(data):
             remote=roi_shared_replays.find(relay_url(f'/replays/{pid()}'),relay_credential(),data)
         except (OSError,ValueError,sqlite3.Error):pass
         rows=roi_shared_replays.merge(replay_outbox(),pid(),rows,remote)
-        return ok({'sv_replays':rows})
+        return ok({'sv_replays':[_replay_for_native(row) for row in rows]})
     except (OSError, ValueError, sqlite3.Error):
         return {'result': 'NG', 'time': str(int(time.time())), 'data': {'sv_replays': []}}
 
@@ -1031,7 +1055,7 @@ def load_replay(data):
         except ValueError:
             import roi_shared_replays
             row=roi_shared_replays.load(relay_url(f'/replays/{pid()}'),relay_credential(),data['sv_replayId'])
-        return ok(row)
+        return ok(_replay_for_native(row))
     except (OSError, ValueError, sqlite3.Error):
         return {'result': 'NG', 'time': str(int(time.time())), 'data': {}}
 
